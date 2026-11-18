@@ -23,6 +23,12 @@ final class WatchModel: ObservableObject {
     @Published var offline = false
     @Published var activity: Activity?
     @Published var lastChecked: Date?
+    /// The latest weekly summary, however old.
+    @Published var summary: WeekSummary?
+    /// True when the summary line shows all of itself.
+    @Published var summaryOpen = false
+    /// True when some app on this Mac opens launchcheck links.
+    @Published var canOpenReport = false
     @Published var now = Date()
 
     @Published var expanded: UUID?
@@ -41,17 +47,22 @@ final class WatchModel: ObservableObject {
 
     /// Called with events that are new, for notifications.
     var announce: ([SiteEvent]) -> Void = { _ in }
+    /// Called with a weekly summary the moment it is written.
+    var announceSummary: (WeekSummary) -> Void = { _ in }
     /// The height the panel draws at, so the window knows which clicks are outside it.
     var panelHeight: CGFloat = 0
     /// False when the system says there is no network at all.
     var online = true
 
     private let watcher: Watcher?
+    private let schemes: SchemeChecking
     private var queue: Task<Void, Never>?
     private var waiting = 0
 
-    init(watcher: Watcher?) {
+    init(watcher: Watcher?, schemes: SchemeChecking) {
         self.watcher = watcher
+        self.schemes = schemes
+        canOpenReport = ReportLink.available(schemes)
         if Notifier.inBundle { launchAtLogin = SMAppService.mainApp.status == .enabled }
     }
 
@@ -69,6 +80,15 @@ final class WatchModel: ObservableObject {
 
     var attentionCount: Int {
         offline ? 0 : sites.filter(\.health.needsAttention).count
+    }
+
+    /// The summary as the panel shows it, or nil when it is switched off, there is nothing to watch,
+    /// or the latest one is too old to be called last week.
+    var summaryLine: String? {
+        guard settings.weeklySummary, !sites.isEmpty, let summary else { return nil }
+        let age = now.timeIntervalSince(summary.date)
+        guard age < 7 * 86_400 + 3600 else { return nil }
+        return summary.text(now: max(now, summary.date))
     }
 
     // MARK: Work
@@ -93,6 +113,7 @@ final class WatchModel: ObservableObject {
         sites = await watcher.summaries()
         settings = await watcher.settings
         lastChecked = await watcher.lastChecked()
+        summary = await watcher.summary
         now = Date()
         if let expanded, !sites.contains(where: { $0.id == expanded }) { self.expanded = nil }
         if let selected, !sites.contains(where: { $0.id == selected }) { self.selected = nil }
@@ -126,6 +147,11 @@ final class WatchModel: ObservableObject {
             await refresh()
         }
         if !offline {
+            // After the pulses, so the week is summed up with this morning in it; before the audits, which take minutes.
+            if let summary = await watcher.weeklySummaryIfDue() {
+                self.summary = summary
+                announceSummary(summary)
+            }
             for id in await watcher.auditsDue() {
                 guard let host = sites.first(where: { $0.id == id })?.site.host else { continue }
                 activity = .auditing(host)
@@ -190,7 +216,22 @@ final class WatchModel: ObservableObject {
         NSWorkspace.shared.open(url)
     }
 
+    func openReport(_ id: UUID) {
+        guard canOpenReport, let site = sites.first(where: { $0.id == id })?.site, let url = ReportLink.url(for: site) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
     // MARK: Panel state
+
+    /// Shows the whole summary or folds it back to one line. Clicks animate; nothing else does.
+    func toggleSummary(animated: Bool) {
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        if animated, !reduceMotion {
+            withAnimation(summaryOpen ? Motion.collapse : Motion.expand) { summaryOpen.toggle() }
+        } else {
+            summaryOpen.toggle()
+        }
+    }
 
     /// Opens or closes a row. Clicks animate; the keyboard does not.
     func toggle(_ id: UUID, animated: Bool) {
@@ -230,7 +271,10 @@ final class WatchModel: ObservableObject {
     func settle() {
         confirmingRemoval = nil
         addProblem = nil
+        summaryOpen = false
         now = Date()
+        // Launchcheck may have been installed or removed since the panel was last open.
+        canOpenReport = ReportLink.available(schemes)
     }
 
     // MARK: Settings

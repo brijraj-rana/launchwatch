@@ -776,3 +776,573 @@ final class WatcherTests: XCTestCase {
         XCTAssertTrue(Store(directory: directory).samples(for: site.id).isEmpty)
     }
 }
+
+// MARK: The week: fixtures
+
+/// A calendar that does not depend on where the tests run.
+private func calendar(_ zone: String = "UTC") -> Calendar {
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone(identifier: zone)!
+    return calendar
+}
+
+private func date(_ year: Int, _ month: Int, _ day: Int, _ hour: Int = 0, _ minute: Int = 0, in zone: String = "UTC") -> Date {
+    calendar(zone).date(from: DateComponents(year: year, month: month, day: day, hour: hour, minute: minute))!
+}
+
+/// Monday 18 January 2027, 9:00 in the morning, UTC. `start` is the Friday before it.
+private let monday = date(2027, 1, 18, 9)
+private let week: TimeInterval = 7 * 86_400
+
+private func watched(_ host: String, _ change: (inout SiteState) -> Void = { _ in }) -> Entry {
+    var state = SiteState()
+    change(&state)
+    return Entry(site: Site(url: "https://\(host)/", host: host, added: monday.addingTimeInterval(-30 * 86_400)), state: state)
+}
+
+/// One pulse an hour for the week before `now`, all answered.
+private func hourly(until now: Date) -> [Sample] {
+    (1...168).reversed().map { Sample(date: now.addingTimeInterval(-3600 * TimeInterval($0)), status: 200, milliseconds: 200) }
+}
+
+/// Failed pulses starting `ago` before `now`, then an answer `length` after the first of them.
+private func outage(_ ago: TimeInterval, lasting length: TimeInterval, until now: Date) -> [Sample] {
+    let first = now.addingTimeInterval(-ago)
+    return [
+        Sample(date: first, status: 0, milliseconds: 0),
+        Sample(date: first.addingTimeInterval(30), status: 0, milliseconds: 0),
+        Sample(date: first.addingTimeInterval(length / 2), status: 0, milliseconds: 0),
+        Sample(date: first.addingTimeInterval(length), status: 200, milliseconds: 200),
+    ]
+}
+
+/// A steady week with one outage in it. Nothing answers while the site is down.
+private func hourly(until now: Date, downFrom ago: TimeInterval, lasting length: TimeInterval) -> [Sample] {
+    let first = now.addingTimeInterval(-ago)
+    let steady = hourly(until: now).filter { $0.date < first || $0.date > first.addingTimeInterval(length) }
+    return sorted(steady + outage(ago, lasting: length, until: now))
+}
+
+private func sorted(_ samples: [Sample]) -> [Sample] {
+    samples.sorted { $0.date < $1.date }
+}
+
+private func event(_ kind: EventKind, on entry: Entry, at date: Date) -> SiteEvent {
+    SiteEvent(site: entry.site, kind: kind, level: .warning, message: "", brief: "", date: date)
+}
+
+// MARK: Weekly summary
+
+final class WeekSummaryTests: XCTestCase {
+    private let hosts = ["acme-rockets.com", "tidyhq.io", "northwind-studio.com", "harbour-coffee.co", "fieldnotes.studio", "lumen-bikes.com"]
+
+    private func steadyWeek(_ entries: [Entry]) -> [UUID: [Sample]] {
+        var samples: [UUID: [Sample]] = [:]
+        for entry in entries { samples[entry.site.id] = hourly(until: monday) }
+        return samples
+    }
+
+    func testAQuietWeekIsSaidBriefly() {
+        let entries = hosts.map { watched($0) }
+        let summary = WeekSummary.make(entries: entries, samples: steadyWeek(entries), events: [], now: monday)
+        XCTAssertEqual(summary?.text(now: monday), "Last week: all 6 sites stayed up.")
+        XCTAssertEqual(summary?.body(now: monday), "All 6 sites stayed up.")
+        XCTAssertEqual(summary?.uneventful, true)
+
+        let two = Array(entries.prefix(2))
+        XCTAssertEqual(WeekSummary.make(entries: two, samples: steadyWeek(two), events: [], now: monday)?.text(now: monday),
+                       "Last week: both sites stayed up.")
+        let one = Array(entries.prefix(1))
+        let alone = WeekSummary.make(entries: one, samples: steadyWeek(one), events: [], now: monday)
+        XCTAssertEqual(alone?.text(now: monday), "Last week: acme-rockets.com stayed up.")
+        XCTAssertEqual(alone?.body(now: monday), "acme-rockets.com stayed up.")
+    }
+
+    func testOneDroppedRequestDoesNotSpoilAQuietWeek() {
+        let entries = hosts.map { watched($0) }
+        var samples = steadyWeek(entries)
+        let blip = Sample(date: monday.addingTimeInterval(-3600 * 30.5), status: 0, milliseconds: 0)
+        samples[entries[0].site.id] = sorted(hourly(until: monday) + [blip])
+        let summary = WeekSummary.make(entries: entries, samples: samples, events: [], now: monday)
+        XCTAssertEqual(summary?.outages, 0)
+        XCTAssertEqual(summary?.text(now: monday), "Last week: all 6 sites stayed up.")
+    }
+
+    func testAWeekWithAnOutageACertificateAndAScoreDrop() {
+        let entries = hosts.map { host in
+            watched(host) { if host == "harbour-coffee.co" { $0.certificateExpiry = monday.addingTimeInterval(9.5 * 86_400) } }
+        }
+        var samples = steadyWeek(entries)
+        samples[entries[0].site.id] = hourly(until: monday, downFrom: 50.5 * 3600, lasting: 12.0 * 60)
+        let events = [
+            event(.scoreDropped, on: entries[0], at: monday.addingTimeInterval(-86_400)),
+            event(.scoreDropped, on: entries[0], at: monday.addingTimeInterval(-9 * 86_400)),       // the week before
+            event(.down, on: entries[0], at: monday.addingTimeInterval(-50.5 * 3600)),
+        ]
+        let summary = WeekSummary.make(entries: entries, samples: samples, events: events, now: monday)
+        XCTAssertEqual(summary?.text(now: monday),
+                       "Last week: 6 sites, 99.7% up, 1 outage (acme-rockets.com, 12 minutes), harbour-coffee.co's certificate expires in 9 days, 1 score fell.")
+        XCTAssertEqual(summary?.body(now: monday),
+                       "6 sites, 99.7% up, 1 outage (acme-rockets.com, 12 minutes), harbour-coffee.co's certificate expires in 9 days, 1 score fell.")
+        // Read on Friday, the certificate is counted down from Friday.
+        XCTAssertEqual(summary?.text(now: monday.addingTimeInterval(4 * 86_400)).contains("certificate expires in 5 days"), true)
+    }
+
+    func testSeveralOfEverything() {
+        let entries = [
+            watched("a.com") { $0.certificateExpiry = monday.addingTimeInterval(-3600) },
+            watched("b.com") { $0.certificateExpiry = monday.addingTimeInterval(6.5 * 86_400) },
+            watched("c.com") { $0.certificateExpiry = monday.addingTimeInterval(90 * 86_400) },
+        ]
+        var samples = steadyWeek(entries)
+        samples[entries[0].site.id] = hourly(until: monday, downFrom: 100.5 * 3600, lasting: 10.0 * 60)
+        samples[entries[1].site.id] = hourly(until: monday, downFrom: 60.5 * 3600, lasting: 2.0 * 3600)
+        // c.com went down 20 minutes ago and has not come back.
+        samples[entries[2].site.id] = hourly(until: monday) + [
+            Sample(date: monday.addingTimeInterval(-20.0 * 60), status: 503, milliseconds: 40),
+            Sample(date: monday.addingTimeInterval(-19.5 * 60), status: 503, milliseconds: 40),
+        ]
+        let events = [
+            event(.scoreDropped, on: entries[0], at: monday.addingTimeInterval(-3600)),
+            event(.scoreDropped, on: entries[0], at: monday.addingTimeInterval(-7200)),            // the same site twice is one score
+            event(.scoreDropped, on: entries[1], at: monday.addingTimeInterval(-3600)),
+            event(.noindex, on: entries[2], at: monday.addingTimeInterval(-3600)),
+            event(.sitemapGone, on: entries[2], at: monday.addingTimeInterval(-3600)),
+            event(.slow, on: entries[2], at: monday.addingTimeInterval(-3600)),                    // not counted
+            event(.noindex, on: watched("gone.com"), at: monday.addingTimeInterval(-3600)),        // a site no longer watched
+        ]
+        let summary = WeekSummary.make(entries: entries, samples: samples, events: events, now: monday)
+        XCTAssertEqual(summary?.outages, 3)
+        XCTAssertEqual(summary?.longest, WeekSummary.LongestOutage(host: "b.com", seconds: 7200))
+        XCTAssertEqual(summary?.certificates.map(\.host), ["a.com", "b.com"])
+        XCTAssertEqual(summary?.scoreDrops, 2)
+        XCTAssertEqual(summary?.auditChanges, 2)
+        let text = summary?.text(now: monday) ?? ""
+        XCTAssertTrue(text.hasPrefix("Last week: 3 sites, 9"), text)
+        XCTAssertTrue(text.hasSuffix("% up, 3 outages (the longest on b.com, 2 hours), a.com's certificate has expired (1 more within 14 days), 2 scores fell, the audit flagged 2 changes."), text)
+        for banned in ["\u{2014}", "\u{2013}", "!"] { XCTAssertFalse(text.contains(banned), text) }
+    }
+
+    func testAnOutageStillGoingIsMeasuredToNow() {
+        let samples = hourly(until: monday) + [
+            Sample(date: monday.addingTimeInterval(-20.0 * 60), status: 0, milliseconds: 0),
+            Sample(date: monday.addingTimeInterval(-19.5 * 60), status: 0, milliseconds: 0),
+        ]
+        let found = Stats.outages(samples, now: monday)
+        XCTAssertEqual(found.count, 1)
+        XCTAssertEqual(found.first?.ongoing, true)
+        XCTAssertEqual(found.first?.length, 20.0 * 60)
+
+        let entry = watched("a.com")
+        let summary = WeekSummary.make(entries: [entry], samples: [entry.site.id: samples], events: [], now: monday)
+        XCTAssertEqual(summary?.text(now: monday), "Last week: 1 site, 98.8% up, 1 outage (a.com, 20 minutes).")
+    }
+
+    func testOutagesAreMeasuredLikeTheBackAfterMessage() {
+        let samples = hourly(until: monday, downFrom: 50.5 * 3600, lasting: 12.0 * 60)
+        let found = Stats.outages(samples, now: monday)
+        XCTAssertEqual(found.map(\.length), [12.0 * 60])
+        XCTAssertEqual(found.first?.ongoing, false)
+        XCTAssertTrue(Stats.outages(hourly(until: monday), now: monday).isEmpty)
+        // One that ended before the window opened is not this week's.
+        XCTAssertTrue(Stats.outages(samples, now: monday.addingTimeInterval(6 * 86_400), window: 86_400).isEmpty)
+    }
+
+    func testNoSitesMeansNoSummary() {
+        XCTAssertNil(WeekSummary.make(entries: [], samples: [:], events: [], now: monday))
+    }
+
+    func testTooFewChecksMeansNoSummary() {
+        // The Mac was off all week and has pulsed once since waking: one answer is not a week.
+        let entry = watched("a.com")
+        let once = [Sample(date: monday.addingTimeInterval(-60), status: 200, milliseconds: 200)]
+        XCTAssertNil(WeekSummary.make(entries: [entry], samples: [entry.site.id: once], events: [], now: monday))
+        XCTAssertNil(WeekSummary.make(entries: [entry], samples: [:], events: [], now: monday))
+        // A day of checks is enough.
+        let day = Array(hourly(until: monday).suffix(24))
+        XCTAssertNotNil(WeekSummary.make(entries: [entry], samples: [entry.site.id: day], events: [], now: monday))
+    }
+
+    func testTheSummaryIsKeptWithTheLibrary() throws {
+        let directory = scratch()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var library = Library()
+        library.summary = WeekSummary(date: monday, sites: 6, uptime: 0.999, outages: 1,
+                                      longest: WeekSummary.LongestOutage(host: "acme-rockets.com", seconds: 720),
+                                      certificates: [WeekSummary.Certificate(host: "harbour-coffee.co", expiry: monday.addingTimeInterval(9.5 * 86_400))],
+                                      scoreDrops: 1)
+        library.weekHandled = monday
+        library.settings.weeklySummary = false
+        Store(directory: directory).save(library)
+        XCTAssertEqual(Store(directory: directory).loadLibrary(), library)
+    }
+
+    func testALibraryFromBeforeTheSummaryStillReads() throws {
+        // Written by 0.1.1: no summary, no weekHandled, no weeklySummary setting. Losing the sites here would be unforgivable.
+        let old = """
+        {"entries":[{"site":{"added":1800000000,"host":"acme-rockets.com","id":"0B1E5C6E-4C0B-4B4E-9C39-6D3B6B0A2F11","url":"https://acme-rockets.com/"},\
+        "state":{"blockers":0,"certificateStage":0,"failures":0,"homeNoindex":false,"isDown":false,"robotsBlocked":false,"slow":false,"slowStreak":0}}],\
+        "events":[],"settings":{"auditHours":24,"notifications":false,"pulseMinutes":15}}
+        """
+        let directory = scratch()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data(old.utf8).write(to: directory.appendingPathComponent("library.json"))
+        let library = Store(directory: directory).loadLibrary()
+        XCTAssertEqual(library.entries.map(\.site.host), ["acme-rockets.com"])
+        XCTAssertEqual(library.settings.pulseMinutes, 15)
+        XCTAssertEqual(library.settings.auditHours, 24)
+        XCTAssertFalse(library.settings.notifications)
+        XCTAssertTrue(library.settings.weeklySummary, "on unless it was turned off")
+        XCTAssertNil(library.summary)
+        XCTAssertNil(library.weekHandled)
+    }
+}
+
+// MARK: When the summary is due
+
+final class WeeklyTests: XCTestCase {
+    private let utc = calendar()
+
+    func testTheMomentIsMondayAtNineLocalTime() {
+        XCTAssertEqual(Weekly.moment(onOrBefore: monday, calendar: utc), monday, "9:00 itself counts")
+        XCTAssertEqual(Weekly.moment(onOrBefore: monday.addingTimeInterval(-1), calendar: utc), monday.addingTimeInterval(-week))
+        XCTAssertEqual(Weekly.moment(onOrBefore: date(2027, 1, 20, 23, 30), calendar: utc), monday)
+        XCTAssertEqual(Weekly.moment(onOrBefore: date(2027, 1, 24, 23, 59), calendar: utc), monday, "Sunday night still belongs to that Monday")
+
+        // Nine in the morning where the Mac is, not in Greenwich.
+        let newYork = calendar("America/New_York")
+        let there = Weekly.moment(onOrBefore: date(2027, 1, 20, 12), calendar: newYork)
+        XCTAssertEqual(there, date(2027, 1, 18, 9, in: "America/New_York"))
+        XCTAssertEqual(there, monday.addingTimeInterval(5 * 3600))
+    }
+
+    func testDueOnceTheMomentHasPassed() {
+        XCTAssertNil(Weekly.due(handled: monday.addingTimeInterval(-week), now: monday.addingTimeInterval(-60), calendar: utc), "8:59 is too early")
+        XCTAssertEqual(Weekly.due(handled: monday.addingTimeInterval(-week), now: monday, calendar: utc), monday)
+        XCTAssertEqual(Weekly.due(handled: monday.addingTimeInterval(-week), now: monday.addingTimeInterval(40), calendar: utc), monday)
+        XCTAssertEqual(Weekly.due(handled: nil, now: date(2027, 1, 20, 15), calendar: utc), monday, "never dealt with anything")
+    }
+
+    func testNeverTwiceForTheSameWeek() {
+        // Every check for the rest of the week, a quarter of an hour apart, finds nothing owed.
+        var now = monday
+        while now < monday.addingTimeInterval(week - 1) {
+            XCTAssertNil(Weekly.due(handled: monday, now: now, calendar: utc))
+            now += 900
+        }
+        XCTAssertEqual(Weekly.due(handled: monday, now: monday.addingTimeInterval(week), calendar: utc), monday.addingTimeInterval(week))
+    }
+
+    func testAsleepThroughMondayItComesAtTheFirstChanceAfter() {
+        let lastWeek = monday.addingTimeInterval(-week)
+        // The lid was shut from Sunday night to Wednesday afternoon.
+        let wednesday = date(2027, 1, 20, 14, 12)
+        XCTAssertEqual(Weekly.due(handled: lastWeek, now: wednesday, calendar: utc), monday)
+        XCTAssertNil(Weekly.due(handled: monday, now: wednesday.addingTimeInterval(15), calendar: utc))
+    }
+
+    func testAsleepForWeeksOwesOneSummaryNotOnePerWeek() {
+        let longAgo = monday.addingTimeInterval(-5 * week)
+        let waking = monday.addingTimeInterval(2 * 86_400)
+        let owed = Weekly.due(handled: longAgo, now: waking, calendar: utc)
+        XCTAssertEqual(owed, monday, "only the latest Monday")
+        XCTAssertNil(Weekly.due(handled: owed, now: waking.addingTimeInterval(15), calendar: utc))
+    }
+
+    func testAClockSetBackDoesNotSendAgain() {
+        // Sent on Monday, then the clock is put back to Sunday, or to the Monday before.
+        XCTAssertNil(Weekly.due(handled: monday, now: monday.addingTimeInterval(-86_400), calendar: utc))
+        XCTAssertNil(Weekly.due(handled: monday, now: monday.addingTimeInterval(-week + 60), calendar: utc))
+        XCTAssertEqual(Weekly.settled(handled: monday, now: monday.addingTimeInterval(-86_400), calendar: utc), monday, "a small step back changes nothing")
+        // Time then runs forward through Monday 9:00 a second time: still nothing.
+        XCTAssertNil(Weekly.due(handled: monday, now: monday.addingTimeInterval(30), calendar: utc))
+    }
+
+    func testAClockOnceSetFarAheadDoesNotSilenceTheSummaryForGood() {
+        // A summary went out while the clock said March. Back in January, that record would never come round.
+        let march = monday.addingTimeInterval(8 * week)
+        let tuesday = monday.addingTimeInterval(86_400)
+        XCTAssertNil(Weekly.due(handled: march, now: tuesday, calendar: utc))
+        let settled = Weekly.settled(handled: march, now: tuesday, calendar: utc)
+        XCTAssertEqual(settled, monday, "this week counts as dealt with")
+        XCTAssertNil(Weekly.due(handled: settled, now: tuesday, calendar: utc))
+        XCTAssertEqual(Weekly.due(handled: settled, now: monday.addingTimeInterval(week + 5), calendar: utc), monday.addingTimeInterval(week))
+    }
+
+    func testAClockSetForwardSendsOneAndThenWaits() {
+        let nextMonth = monday.addingTimeInterval(4 * week + 3 * 86_400)
+        let owed = Weekly.due(handled: monday, now: nextMonth, calendar: utc)
+        XCTAssertEqual(owed, monday.addingTimeInterval(4 * week))
+        XCTAssertNil(Weekly.due(handled: owed, now: nextMonth.addingTimeInterval(15), calendar: utc))
+    }
+
+    func testMovingTimeZoneIsNotANewWeek() {
+        // Monday 9:00 in Auckland, then the same Monday 9:00 comes round again in Honolulu, 23 hours later.
+        let auckland = date(2027, 1, 18, 9, in: "Pacific/Auckland")
+        let honolulu = calendar("Pacific/Honolulu")
+        let there = date(2027, 1, 18, 9, 30, in: "Pacific/Honolulu")
+        XCTAssertGreaterThan(there, auckland)
+        XCTAssertLessThan(there.timeIntervalSince(auckland), 2 * 86_400)
+        XCTAssertNil(Weekly.due(handled: auckland, now: there, calendar: honolulu))
+        XCTAssertEqual(Weekly.due(handled: auckland, now: there.addingTimeInterval(week), calendar: honolulu), date(2027, 1, 25, 9, in: "Pacific/Honolulu"))
+    }
+}
+
+// MARK: The weekly summary, end to end
+
+final class WeeklyWatcherTests: XCTestCase {
+    private var directory: URL!
+    private var pulser: StubPulser!
+    private var clock: TestClock!
+
+    override func setUp() {
+        directory = scratch()
+        pulser = StubPulser()
+        clock = TestClock(start)        // Friday 15 January 2027, 8:00 UTC
+        pulser.queue("acme-rockets.com", up)
+    }
+
+    override func tearDown() {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    private func watcher() -> Watcher {
+        let clock = self.clock!
+        return Watcher(store: Store(directory: directory), pulser: pulser, auditor: StubAuditor(), clock: { clock.now }, calendar: calendar())
+    }
+
+    /// Lets time pass to `end`, pulsing once an hour on the way and once on arriving.
+    private func run(_ watcher: Watcher, until end: Date) async {
+        while clock.now < end {
+            clock.advance(min(3600, end.timeIntervalSince(clock.now)))
+            _ = await watcher.pulseDue()
+        }
+    }
+
+    func testSentOnceOnMondayAndKept() async {
+        let watcher = watcher()
+        _ = await watcher.add("acme-rockets.com")
+        var sent = await watcher.weeklySummaryIfDue()
+        XCTAssertNil(sent, "a site added on Friday has no week behind it at the Monday before")
+
+        await run(watcher, until: monday.addingTimeInterval(-300))
+        sent = await watcher.weeklySummaryIfDue()
+        XCTAssertNil(sent, "five to nine is too early")
+
+        await run(watcher, until: monday)
+        sent = await watcher.weeklySummaryIfDue()
+        XCTAssertEqual(sent?.text(now: clock.now), "Last week: acme-rockets.com stayed up.")
+
+        sent = await watcher.weeklySummaryIfDue()
+        XCTAssertNil(sent, "the same check a moment later")
+        await run(watcher, until: monday.addingTimeInterval(3 * 86_400))
+        sent = await watcher.weeklySummaryIfDue()
+        XCTAssertNil(sent, "the rest of the week")
+
+        // Quit and opened again: still dealt with, and the summary is still there for the panel.
+        let reopened = self.watcher()
+        sent = await reopened.weeklySummaryIfDue()
+        XCTAssertNil(sent)
+        let kept = await reopened.summary
+        XCTAssertEqual(kept?.text(now: clock.now), "Last week: acme-rockets.com stayed up.")
+
+        await run(reopened, until: monday.addingTimeInterval(week))
+        sent = await reopened.weeklySummaryIfDue()
+        XCTAssertNotNil(sent, "next Monday brings the next one")
+    }
+
+    func testAsleepOverMondayItIsSentOnWaking() async {
+        let watcher = watcher()
+        _ = await watcher.add("acme-rockets.com")
+        _ = await watcher.weeklySummaryIfDue()
+        await run(watcher, until: monday.addingTimeInterval(-86_400))       // Sunday morning, then the lid is shut
+
+        clock.advance(3 * 86_400 + 4000)                                    // Wednesday
+        _ = await watcher.pulseDue()
+        var sent = await watcher.weeklySummaryIfDue()
+        XCTAssertEqual(sent?.sites, 1)
+        sent = await watcher.weeklySummaryIfDue()
+        XCTAssertNil(sent)
+    }
+
+    func testSwitchedOffNothingIsSentAndTurningItOnDoesNotSendLate() async {
+        let watcher = watcher()
+        _ = await watcher.add("acme-rockets.com")
+        var settings = WatchSettings()
+        settings.weeklySummary = false
+        await watcher.set(settings)
+
+        await run(watcher, until: monday.addingTimeInterval(600))
+        var sent = await watcher.weeklySummaryIfDue()
+        XCTAssertNil(sent)
+        var kept = await watcher.summary
+        XCTAssertNil(kept)
+
+        settings.weeklySummary = true
+        await watcher.set(settings)
+        sent = await watcher.weeklySummaryIfDue()
+        XCTAssertNil(sent, "Monday has been and gone; the first summary is next Monday's")
+        await run(watcher, until: monday.addingTimeInterval(week))
+        sent = await watcher.weeklySummaryIfDue()
+        XCTAssertNotNil(sent)
+        kept = await watcher.summary
+        XCTAssertEqual(kept, sent)
+    }
+
+    func testWithNoSitesNothingIsSent() async {
+        let watcher = watcher()
+        clock.advance(4 * 86_400)
+        var sent = await watcher.weeklySummaryIfDue()
+        XCTAssertNil(sent)
+
+        // A site added on Tuesday does not get last week's summary a minute later.
+        _ = await watcher.add("acme-rockets.com")
+        await run(watcher, until: clock.now.addingTimeInterval(86_400 + 3600))
+        sent = await watcher.weeklySummaryIfDue()
+        XCTAssertNil(sent)
+    }
+}
+
+// MARK: Uptime strip
+
+final class StripTests: XCTestCase {
+    private let utc = calendar()
+    /// Friday 15 January 2027, 8:00 UTC: two hours into the 6:00 to 12:00 stretch.
+    private let now = start
+
+    private func sample(hoursAgo: Double, ok: Bool = true) -> Sample {
+        Sample(date: now.addingTimeInterval(-hoursAgo * 3600), status: ok ? 200 : 0, milliseconds: ok ? 200 : 0)
+    }
+
+    func testTwentyEightCellsFourADayOnTheClock() {
+        let cells = Stats.strip([], now: now, calendar: utc)
+        XCTAssertEqual(cells.count, 28)
+        XCTAssertEqual(cells.last?.start, date(2027, 1, 15, 6))
+        XCTAssertEqual(cells.last?.end, date(2027, 1, 15, 12))
+        XCTAssertEqual(cells.first?.start, date(2027, 1, 8, 12))
+        for (before, after) in zip(cells, cells.dropFirst()) {
+            XCTAssertEqual(before.end, after.start)
+            XCTAssertEqual(after.start.timeIntervalSince(before.start), 6.0 * 3600)
+        }
+        XCTAssertTrue(cells.allSatisfy { $0.state == .empty })
+
+        // The stretches follow the local clock, not Greenwich: 8:00 UTC is 13:30 in Kolkata, in the 12:00 to 18:00 stretch.
+        let kolkata = Stats.strip([], now: now, calendar: calendar("Asia/Kolkata"))
+        XCTAssertEqual(kolkata.last?.start, date(2027, 1, 15, 12, in: "Asia/Kolkata"))
+    }
+
+    func testUpDownAndGaps() {
+        let samples = [
+            sample(hoursAgo: 170),                      // before the strip begins
+            sample(hoursAgo: 50),                       // cell 19: up
+            sample(hoursAgo: 49.9, ok: false),          // one dropped request in an otherwise good stretch
+            sample(hoursAgo: 49.8),
+            sample(hoursAgo: 25),                       // cell 23
+            sample(hoursAgo: 24.5, ok: false),
+            sample(hoursAgo: 24.4, ok: false),          // twice in a row: down
+            sample(hoursAgo: 24.2),
+            sample(hoursAgo: 1),                        // cell 27, the stretch under way
+            sample(hoursAgo: -1),                       // the future, after a clock change
+        ]
+        let cells = Stats.strip(samples, now: now, calendar: utc)
+        XCTAssertEqual(cells[19].state, .up, "one dropped request is not down")
+        XCTAssertEqual(cells[23].state, .down)
+        XCTAssertEqual(cells[27].state, .up)
+        XCTAssertEqual(cells.filter { $0.state == .empty }.count, 25, "nothing was measured, so nothing is claimed")
+        XCTAssertEqual(cells[0].state, .empty)
+    }
+
+    func testAnOutageAcrossTwoStretchesMarksBoth() {
+        // Down from 5:50 to 6:10, either side of the 6:00 line.
+        let samples = [
+            sample(hoursAgo: 3),
+            sample(hoursAgo: 2.0 + 10.0 / 60, ok: false),
+            sample(hoursAgo: 1.0 + 50.0 / 60, ok: false),
+            sample(hoursAgo: 1.5),
+        ]
+        let cells = Stats.strip(samples, now: now, calendar: utc)
+        XCTAssertEqual(cells[26].state, .down)
+        XCTAssertEqual(cells[27].state, .down)
+    }
+
+    func testAPulseOnTheLineBelongsToTheStretchItStarts() {
+        let onTheLine = Sample(date: date(2027, 1, 15, 0), status: 200, milliseconds: 200)
+        let cells = Stats.strip([onTheLine], now: now, calendar: utc)
+        XCTAssertEqual(cells[26].state, .up)
+        XCTAssertEqual(cells[25].state, .empty)
+    }
+
+    func testDownStaysDownWhateverElseTheStretchHolds() {
+        let samples = [sample(hoursAgo: 1.5, ok: false), sample(hoursAgo: 1.4, ok: false), sample(hoursAgo: 1), sample(hoursAgo: 0.5)]
+        XCTAssertEqual(Stats.strip(samples, now: now, calendar: utc)[27].state, .down)
+    }
+
+    func testOtherShapes() {
+        XCTAssertEqual(Stats.strip([], now: now, calendar: utc, days: 2, perDay: 2).count, 4)
+        XCTAssertTrue(Stats.strip([], now: now, calendar: utc, days: 0).isEmpty)
+    }
+
+    func testSpokenSummary() {
+        func cells(_ states: [StripCell.State]) -> [StripCell] {
+            states.map { StripCell(state: $0, start: now, end: now) }
+        }
+        let up = [StripCell.State](repeating: .up, count: 28)
+        XCTAssertEqual(Stats.stripSummary(cells(up)), "Up through all of the last 7 days.")
+        XCTAssertEqual(Stats.stripSummary(cells([.empty, .empty] + up.dropFirst(2))), "Up whenever it was checked in the last 7 days. Not checked during 2.")
+        XCTAssertEqual(Stats.stripSummary(cells([.down, .down, .empty] + up.dropFirst(3))),
+                       "Down during 2 of the 28 six hour stretches in the last 7 days. Not checked during 1.")
+        XCTAssertEqual(Stats.stripSummary(cells([.down] + up.dropFirst(1))), "Down during 1 of the 28 six hour stretches in the last 7 days.")
+        XCTAssertEqual(Stats.stripSummary(cells([StripCell.State](repeating: .empty, count: 28))), "No checks in the last 7 days.")
+        XCTAssertEqual(StripCell(state: .down, start: now, end: now).words, "down for some of it")
+    }
+
+    func testTheRowCarriesItsStrip() {
+        var state = SiteState()
+        state.lastPulse = now
+        let row = SiteSummary.make(Entry(site: site, state: state), samples: [sample(hoursAgo: 1)], events: [], now: now, calendar: utc)
+        XCTAssertEqual(row.strip.count, 28)
+        XCTAssertEqual(row.strip.last?.state, .up)
+    }
+}
+
+// MARK: Opening the report in Launchcheck
+
+/// Says an app is there, or is not, and remembers what it was asked.
+final class StubSchemes: SchemeChecking, @unchecked Sendable {
+    private let lock = NSLock()
+    private let installed: Bool
+    private var seen: [URL] = []
+
+    init(installed: Bool) { self.installed = installed }
+
+    var asked: [URL] { lock.withLock { seen } }
+
+    func hasApp(for url: URL) -> Bool {
+        lock.withLock {
+            seen.append(url)
+            return installed
+        }
+    }
+}
+
+final class ReportLinkTests: XCTestCase {
+    func testTheLinkIsExactlyTheFormLaunchcheckExpects() {
+        XCTAssertEqual(ReportLink.url(for: site)?.absoluteString, "launchcheck://open?site=acme-rockets.com")
+        let mixed = Site(url: "https://WWW.Example.com/", host: "www.example.com", added: start)
+        XCTAssertEqual(ReportLink.url(for: mixed)?.absoluteString, "launchcheck://open?site=www.example.com")
+        let local = Site(url: "http://localhost:8080/", host: "localhost", added: start)
+        XCTAssertEqual(ReportLink.url(for: local)?.absoluteString, "launchcheck://open?site=localhost:8080")
+        XCTAssertNil(ReportLink.url(for: Site(url: "", host: "", added: start)))
+    }
+
+    func testOfferedOnlyWhenSomeAppOpensTheScheme() {
+        let present = StubSchemes(installed: true)
+        XCTAssertTrue(ReportLink.available(present))
+        XCTAssertEqual(present.asked.map(\.scheme), ["launchcheck"], "it asks about a launchcheck link and nothing else")
+
+        let absent = StubSchemes(installed: false)
+        XCTAssertFalse(ReportLink.available(absent))
+        XCTAssertEqual(absent.asked.count, 1)
+    }
+}

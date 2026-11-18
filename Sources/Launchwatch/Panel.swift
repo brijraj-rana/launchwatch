@@ -13,6 +13,10 @@ struct PanelView: View {
             if !model.sites.isEmpty {
                 Hairline()
                 SiteList(model: model)
+                if let line = model.summaryLine {
+                    Hairline()
+                    SummaryRow(model: model, text: line)
+                }
             }
             Hairline()
             AddField(model: model)
@@ -134,10 +138,14 @@ private struct SiteRow: View {
                 .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
                 .accessibilityAction(named: "Check now") { model.check(site.id) }
                 .accessibilityAction(named: "Open site") { model.open(site.id) }
+                .accessibilityActions {
+                    if model.canOpenReport { Button("Open report in Launchcheck") { model.openReport(site.id) } }
+                }
                 .accessibilityAction(named: "Remove") { model.remove(site.id) }
                 .contextMenu {
                     Button("Check Now") { model.check(site.id) }
                     Button("Open Site") { model.open(site.id) }
+                    if model.canOpenReport { Button("Open Report in Launchcheck") { model.openReport(site.id) } }
                     Button("Copy Address") {
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(site.site.url, forType: .string)
@@ -208,10 +216,16 @@ private struct SiteDetail: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             timeline
-            HStack(alignment: .top, spacing: 0) {
-                fact(site.uptime.map(Words.percent) ?? "No data", "Uptime, 7 days")
-                fact(site.median.map(Words.time) ?? "No data", "Usual response")
-                fact(certificate, "Certificate until")
+            VStack(alignment: .leading, spacing: 9) {
+                // The week first, then the figure that sums it up.
+                if !site.strip.isEmpty {
+                    UptimeStrip(cells: site.strip, width: Metrics.width - Metrics.indent - Metrics.gutter, muted: model.offline)
+                }
+                HStack(alignment: .top, spacing: 0) {
+                    fact(site.uptime.map(Words.percent) ?? "No data", "Uptime, 7 days")
+                    fact(site.median.map(Words.time) ?? "No data", "Usual response")
+                    fact(certificate, "Certificate until")
+                }
             }
             Text(auditLine)
                 .font(Face.small)
@@ -224,7 +238,12 @@ private struct SiteDetail: View {
                     .help("Check this site now")
                 Button("Open site") { model.open(site.id) }
                     .help("Open \(site.site.host) in the browser")
-                Spacer()
+                // Four buttons fill the row, so the report steps aside while "Stop watching" is asking its question.
+                if model.canOpenReport, model.confirmingRemoval != site.id {
+                    Button("Open report") { model.openReport(site.id) }
+                        .help("Open the full report for \(site.site.host) in Launchcheck")
+                }
+                Spacer(minLength: 0)
                 if model.confirmingRemoval == site.id {
                     Button("Stop watching") { model.remove(site.id) }
                         .accessibilityLabel("Confirm: stop watching \(site.site.host)")
@@ -311,6 +330,60 @@ private struct SiteDetail: View {
                 }
             }
         }
+    }
+}
+
+// MARK: Weekly summary
+
+/// Last week in one quiet line under the list. A week with nothing in it fits and just sits there;
+/// a longer one is cut short and opens when clicked, the way a site row does.
+private struct SummaryRow: View {
+    @ObservedObject var model: WatchModel
+    let text: String
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            words.lineLimit(1).fixedSize()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, Metrics.indent)
+                .padding(.trailing, Metrics.gutter)
+                .padding(.vertical, 11)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(text)
+            Button { model.toggleSummary(animated: true) } label: {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    ZStack(alignment: .topLeading) {
+                        if model.summaryOpen {
+                            words.fixedSize(horizontal: false, vertical: true).lineSpacing(2).transition(.soft)
+                        } else {
+                            words.lineLimit(1).truncationMode(.tail).transition(.soft)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(model.summaryOpen ? 180 : 0))
+                }
+                .padding(.leading, Metrics.indent)
+                .padding(.trailing, Metrics.gutter)
+                .padding(.vertical, 11)
+            }
+            .buttonStyle(RowButton())
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(text)
+            .accessibilityAddTraits(.isButton)
+            .accessibilityHint(model.summaryOpen ? "Folds the summary back to one line" : "Shows the whole summary")
+        }
+    }
+
+    /// "Last week:" a touch stronger than what follows, so the eye can find the line and then leave it alone.
+    private var words: Text {
+        let label = "Last week:"
+        // A host name should not break across lines at its hyphen.
+        let rest = (text.hasPrefix(label) ? String(text.dropFirst(label.count)) : " " + text).replacingOccurrences(of: "-", with: "\u{2011}")
+        return (Text(label).font(Face.smallStrong).foregroundStyle(.primary) + Text(rest).font(Face.small).foregroundStyle(.secondary))
+            .monospacedDigit()
     }
 }
 
@@ -409,6 +482,9 @@ private struct SettingsRows: View {
             }
             line("Notify me when something changes") {
                 Switch(label: "Notifications", isOn: model.settings.notifications) { model.change { $0.notifications.toggle() } }
+            }
+            line("Weekly summary on Mondays") {
+                Switch(label: "Weekly summary on Mondays", isOn: model.settings.weeklySummary) { model.change { $0.weeklySummary.toggle() } }
             }
             line("Open at login") {
                 Switch(label: "Open at login", isOn: model.launchAtLogin) { model.setLaunchAtLogin(!model.launchAtLogin) }

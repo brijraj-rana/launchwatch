@@ -241,6 +241,8 @@ public struct SiteSummary: Equatable, Identifiable, Sendable {
     public var state: SiteState
     public var health: Health
     public var buckets: [Bucket]
+    /// The last week in six hour stretches, oldest first.
+    public var strip: [StripCell]
     public var uptime: Double?
     public var median: Int?
     /// Newest first.
@@ -248,19 +250,21 @@ public struct SiteSummary: Equatable, Identifiable, Sendable {
 
     public var id: UUID { site.id }
 
-    public init(site: Site, state: SiteState, health: Health, buckets: [Bucket], uptime: Double?, median: Int?, events: [SiteEvent]) {
+    public init(site: Site, state: SiteState, health: Health, buckets: [Bucket], strip: [StripCell] = [], uptime: Double?, median: Int?, events: [SiteEvent]) {
         self.site = site
         self.state = state
         self.health = health
         self.buckets = buckets
+        self.strip = strip
         self.uptime = uptime
         self.median = median
         self.events = events
     }
 
-    public static func make(_ entry: Entry, samples: [Sample], events: [SiteEvent], now: Date) -> SiteSummary {
+    public static func make(_ entry: Entry, samples: [Sample], events: [SiteEvent], now: Date, calendar: Calendar = .current) -> SiteSummary {
         SiteSummary(site: entry.site, state: entry.state, health: Health.of(entry.state, now: now),
-                    buckets: Stats.buckets(samples, now: now), uptime: Stats.uptime(samples, now: now),
+                    buckets: Stats.buckets(samples, now: now), strip: Stats.strip(samples, now: now, calendar: calendar),
+                    uptime: Stats.uptime(samples, now: now),
                     median: Stats.medianResponse(samples, now: now),
                     events: events.filter { $0.site == entry.site.id }.sorted { $0.date > $1.date })
     }

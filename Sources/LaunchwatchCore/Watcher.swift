@@ -37,14 +37,17 @@ public actor Watcher {
     private let pulser: Pulser
     private let auditor: SiteAuditing
     private let clock: @Sendable () -> Date
+    private let calendar: Calendar
     private var library: Library
     private var samples: [UUID: [Sample]] = [:]
 
-    public init(store: Store, pulser: Pulser = URLSessionPulser(), auditor: SiteAuditing = EngineAuditor(), clock: @escaping @Sendable () -> Date = { Date() }) {
+    public init(store: Store, pulser: Pulser = URLSessionPulser(), auditor: SiteAuditing = EngineAuditor(), clock: @escaping @Sendable () -> Date = { Date() },
+                calendar: Calendar = .autoupdatingCurrent) {
         self.store = store
         self.pulser = pulser
         self.auditor = auditor
         self.clock = clock
+        self.calendar = calendar
         let library = store.loadLibrary()
         self.library = library
         var samples: [UUID: [Sample]] = [:]
@@ -60,8 +63,11 @@ public actor Watcher {
 
     public func summaries() -> [SiteSummary] {
         let now = clock()
-        return SiteSummary.sorted(library.entries.map { SiteSummary.make($0, samples: samples[$0.site.id] ?? [], events: library.events, now: now) })
+        return SiteSummary.sorted(library.entries.map { SiteSummary.make($0, samples: samples[$0.site.id] ?? [], events: library.events, now: now, calendar: calendar) })
     }
+
+    /// The latest weekly summary, or nil before the first one.
+    public var summary: WeekSummary? { library.summary }
 
     public func pulsesDue() -> [UUID] {
         Scheduler.pulsesDue(library.entries, settings: library.settings, now: clock())
@@ -178,6 +184,33 @@ public actor Watcher {
         record(folded.events, now: now)
         store.save(library)
         return folded.events
+    }
+
+    /// Called at every due-check. Once Monday morning has passed it deals with that week exactly once: it returns the
+    /// summary to announce, or nil when there is nothing to say, the setting is off, or the week has been dealt with.
+    public func weeklySummaryIfDue() -> WeekSummary? {
+        let now = clock()
+        let settled = Weekly.settled(handled: library.weekHandled, now: now, calendar: calendar)
+        guard let moment = Weekly.due(handled: settled, now: now, calendar: calendar) else {
+            if settled != library.weekHandled {
+                library.weekHandled = settled
+                store.save(library)
+            }
+            return nil
+        }
+        library.weekHandled = moment
+        defer { store.save(library) }
+        guard library.settings.weeklySummary else { return nil }
+        // A site added after Monday morning has no week to look back on yet.
+        let watched = library.entries.filter { $0.site.added < moment }
+        guard let summary = WeekSummary.make(entries: watched, samples: samples, events: library.events, now: now) else { return nil }
+        library.summary = summary
+        return summary
+    }
+
+    /// What the summary would say if it were written now, whether or not one is due. Changes nothing.
+    public func summaryNow() -> WeekSummary? {
+        WeekSummary.make(entries: library.entries, samples: samples, events: library.events, now: clock())
     }
 
     private func record(_ events: [SiteEvent], now: Date) {

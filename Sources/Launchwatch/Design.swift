@@ -264,6 +264,72 @@ extension Bucket {
     }
 }
 
+// MARK: Uptime strip
+
+/// The last week, four cells a day, oldest on the left: the same squares as the page map in Launchcheck, scaled to fit.
+/// Neutral where the site was up, red where it was down, paler where nobody was checking.
+struct UptimeStrip: View {
+    let cells: [StripCell]
+    let width: CGFloat
+    var muted = false
+
+    static let height: CGFloat = 9
+    private static let gap: CGFloat = 3
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ForEach(Array(cells.enumerated()), id: \.offset) { index, cell in
+                let span = edges(index)
+                Cell(cell: cell, muted: muted)
+                    .frame(width: span.end - span.start, height: Self.height)
+                    .padding(.trailing, index == cells.count - 1 ? 0 : edges(index + 1).start - span.end)
+            }
+        }
+        .frame(width: width, alignment: .leading)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Stats.stripSummary(cells))
+    }
+
+    /// Where a cell starts and ends, on whole pixels so every edge is sharp.
+    private func edges(_ index: Int) -> (start: CGFloat, end: CGFloat) {
+        let count = CGFloat(max(cells.count, 1))
+        let side = (width - Self.gap * (count - 1)) / count
+        let start = CGFloat(index) * (side + Self.gap)
+        return ((start * 2).rounded() / 2, ((start + side) * 2).rounded() / 2)
+    }
+
+    private struct Cell: View {
+        let cell: StripCell
+        let muted: Bool
+        @State private var hovering = false
+
+        var body: some View {
+            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                .fill(fill)
+                .overlay(RoundedRectangle(cornerRadius: 2, style: .continuous).strokeBorder(Color.primary.opacity(hovering ? 0.55 : 0), lineWidth: 1))
+                .contentShape(Rectangle())
+                .onHover { hovering = $0 }
+                .help("\(when): \(cell.words)")
+        }
+
+        private var fill: Color {
+            switch cell.state {
+            case .up: return Color.primary.opacity(0.3)
+            case .down: return muted ? Color.secondary : Tone.critical
+            case .empty: return Color.primary.opacity(0.11)
+            }
+        }
+
+        /// "Tue 17 Nov, 12:00 to 18:00"
+        private var when: String {
+            let day = cell.start.formatted(.dateTime.weekday(.abbreviated).day().month(.abbreviated))
+            let from = cell.start.formatted(.dateTime.hour().minute())
+            let to = cell.end.formatted(.dateTime.hour().minute())
+            return "\(day), \(from) to \(to)"
+        }
+    }
+}
+
 // MARK: Controls
 
 /// The one button shape: a quiet outlined pill that darkens under the pointer and dips when pressed.
@@ -281,6 +347,8 @@ struct QuietButton: ButtonStyle {
             configuration.label
                 .font(Face.smallStrong)
                 .foregroundStyle(.primary)
+                .lineLimit(1)
+                .fixedSize()
                 .padding(.horizontal, 10)
                 .frame(height: 24)
                 .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(configuration.isPressed ? Tone.lift : (hovering ? Tone.wash : .clear)))

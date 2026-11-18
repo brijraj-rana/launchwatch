@@ -27,6 +27,24 @@ enum Notifier {
         if event.level == .critical { content.sound = .default }
         UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: event.id.uuidString, content: content, trigger: nil))
     }
+
+    /// The weekly summary: one quiet notification, no sound.
+    static func post(_ summary: WeekSummary) {
+        guard inBundle else { return }
+        let content = UNMutableNotificationContent()
+        content.title = "Last week"
+        content.body = summary.body(now: summary.date)
+        content.userInfo = ["summary": true]
+        // Always the same identifier, so Notification Center holds the latest summary and never a pile of them.
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "weekly-summary", content: content, trigger: nil))
+    }
+}
+
+/// Asks the system whether any app opens a link.
+struct WorkspaceSchemes: SchemeChecking {
+    func hasApp(for url: URL) -> Bool {
+        NSWorkspace.shared.urlForApplication(toOpen: url) != nil
+    }
 }
 
 // MARK: Menu bar glyph
@@ -79,7 +97,7 @@ final class StatusController: NSObject, NSWindowDelegate, UNUserNotificationCent
 
     override init() {
         let directory = ProcessInfo.processInfo.environment["LAUNCHWATCH_HOME"].map { URL(fileURLWithPath: $0, isDirectory: true) }
-        model = WatchModel(watcher: Watcher(store: Store(directory: directory ?? Store.defaultDirectory)))
+        model = WatchModel(watcher: Watcher(store: Store(directory: directory ?? Store.defaultDirectory)), schemes: WorkspaceSchemes())
         super.init()
     }
 
@@ -125,6 +143,10 @@ final class StatusController: NSObject, NSWindowDelegate, UNUserNotificationCent
         model.announce = { [weak model] events in
             guard let model, model.settings.notifications else { return }
             events.forEach(Notifier.post)
+        }
+        model.announceSummary = { [weak model] summary in
+            guard let model, model.settings.notifications else { return }
+            Notifier.post(summary)
         }
         if Notifier.inBundle { UNUserNotificationCenter.current().delegate = self }
 
@@ -207,7 +229,7 @@ final class StatusController: NSObject, NSWindowDelegate, UNUserNotificationCent
 
     // MARK: Panel
 
-    func openPanel(showing site: UUID? = nil) {
+    func openPanel(showing site: UUID? = nil, summary: Bool = false) {
         guard let button = item.button, let buttonWindow = button.window else { return }
         let anchor = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
         let screen = buttonWindow.screen ?? NSScreen.main ?? NSScreen.screens[0]
@@ -216,6 +238,7 @@ final class StatusController: NSObject, NSWindowDelegate, UNUserNotificationCent
         model.settle()
         model.listLimit = max(184, min(460, area.height - 330))
         if let site { model.expanded = site; model.selected = site }
+        if summary { model.summaryOpen = true }
 
         let x = min(max(anchor.midX - Metrics.width / 2, area.minX + 8), area.maxX - Metrics.width - 8)
         let top = anchor.minY - 5
@@ -318,8 +341,10 @@ final class StatusController: NSObject, NSWindowDelegate, UNUserNotificationCent
     }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
-        let site = (response.notification.request.content.userInfo["site"] as? String).flatMap(UUID.init)
-        await MainActor.run { self.openPanel(showing: site) }
+        let info = response.notification.request.content.userInfo
+        let site = (info["site"] as? String).flatMap(UUID.init)
+        let summary = info["summary"] as? Bool ?? false
+        await MainActor.run { self.openPanel(showing: site, summary: summary) }
     }
 }
 
@@ -352,6 +377,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Snapshot.render(to: directory, scale: value(after: "--scale").flatMap(Double.init).map { CGFloat($0) } ?? 2)
         } else if let address = value(after: "--pulse") {
             Self.pulseOnce(address)
+        } else if args.contains("--summary") {
+            Self.summaryOnce()
         } else {
             NSApp.mainMenu = Self.mainMenu()
             let controller = StatusController()
@@ -386,6 +413,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         edit.submenu = menu
         main.addItem(edit)
         return main
+    }
+
+    /// Development aid: what the weekly summary would say right now, from the stored week. `Launchwatch --summary`
+    private static func summaryOnce() {
+        Task {
+            let directory = ProcessInfo.processInfo.environment["LAUNCHWATCH_HOME"].map { URL(fileURLWithPath: $0, isDirectory: true) }
+            let summary = await Watcher(store: Store(directory: directory ?? Store.defaultDirectory)).summaryNow()
+            print(summary.map { $0.text(now: $0.date) } ?? "Nothing to say: no sites, or less than a day of checks.")
+            exit(0)
+        }
     }
 
     /// Development aid: one real pulse, printed. `Launchwatch --pulse example.com`

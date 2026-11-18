@@ -161,11 +161,22 @@ public struct WatchSettings: Codable, Equatable, Sendable {
     public var pulseMinutes = 5
     public var auditHours = 6
     public var notifications = true
+    /// One summary of the week, on Monday morning.
+    public var weeklySummary = true
 
     public static let pulseChoices = [1, 5, 15]
     public static let auditChoices = [1, 6, 24]
 
     public init() {}
+
+    /// A file written before a setting existed still reads, with that setting at its default.
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        pulseMinutes = try values.decodeIfPresent(Int.self, forKey: .pulseMinutes) ?? 5
+        auditHours = try values.decodeIfPresent(Int.self, forKey: .auditHours) ?? 6
+        notifications = try values.decodeIfPresent(Bool.self, forKey: .notifications) ?? true
+        weeklySummary = try values.decodeIfPresent(Bool.self, forKey: .weeklySummary) ?? true
+    }
 
     public var pulseInterval: TimeInterval { TimeInterval(pulseMinutes * 60) }
     public var auditInterval: TimeInterval { TimeInterval(auditHours * 3600) }
@@ -186,6 +197,20 @@ public struct Library: Codable, Equatable, Sendable {
     public var entries: [Entry] = []
     public var events: [SiteEvent] = []
     public var settings = WatchSettings()
+    /// The latest weekly summary, kept so the panel can still show it.
+    public var summary: WeekSummary?
+    /// The Monday morning most recently dealt with, whether or not anything was sent for it.
+    public var weekHandled: Date?
 
     public init() {}
+
+    /// A file written by an earlier version has no summary; it must still read, or every site would be lost.
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        entries = try values.decodeIfPresent([Entry].self, forKey: .entries) ?? []
+        events = try values.decodeIfPresent([SiteEvent].self, forKey: .events) ?? []
+        settings = try values.decodeIfPresent(WatchSettings.self, forKey: .settings) ?? WatchSettings()
+        summary = try values.decodeIfPresent(WeekSummary.self, forKey: .summary)
+        weekHandled = try values.decodeIfPresent(Date.self, forKey: .weekHandled)
+    }
 }

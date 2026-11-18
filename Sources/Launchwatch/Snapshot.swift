@@ -2,6 +2,11 @@ import AppKit
 import LaunchwatchCore
 import SwiftUI
 
+/// In README images Launchcheck is always installed, whatever is on the Mac that renders them.
+private struct Pretend: SchemeChecking {
+    func hasApp(for url: URL) -> Bool { true }
+}
+
 /// Development aid: renders the panel to PNGs with made-up sites, so README images never show a real client's.
 @MainActor
 enum Snapshot {
@@ -79,8 +84,16 @@ enum Snapshot {
         }
     }
 
+    /// A week in six hour stretches. The Mac slept through one night, so nothing was checked then.
+    private static func week(down: Set<Int> = [], asleep: Set<Int> = [9, 10], from first: Int = 0) -> [StripCell] {
+        Stats.strip([], now: now).enumerated().map { index, cell in
+            let state: StripCell.State = index < first || asleep.contains(index) ? .empty : (down.contains(index) ? .down : .up)
+            return StripCell(state: state, start: cell.start, end: cell.end)
+        }
+    }
+
     private static func site(_ host: String, score: Int?, ms: Int, seed: UInt64, uptime: Double = 1, certificateDays: Double = 61,
-                             buckets: [Bucket]? = nil, events: [(EventKind, Level, String, TimeInterval)] = [],
+                             buckets: [Bucket]? = nil, strip: [StripCell]? = nil, events: [(EventKind, Level, String, TimeInterval)] = [],
                              _ change: (inout SiteState) -> Void = { _ in }) -> SiteSummary {
         let site = Site(url: "https://\(host)/", host: host, added: now.addingTimeInterval(-30 * 86_400))
         var state = SiteState()
@@ -96,7 +109,7 @@ enum Snapshot {
         change(&state)
         let log = events.map { SiteEvent(site: site, kind: $0.0, level: $0.1, message: $0.2, brief: $0.2, date: now.addingTimeInterval(-$0.3)) }
         return SiteSummary(site: site, state: state, health: Health.of(state, now: now), buckets: buckets ?? day(around: ms, seed: seed),
-                           uptime: uptime, median: ms, events: log)
+                           strip: strip ?? week(), uptime: uptime, median: ms, events: log)
     }
 
     private static func healthy() -> [SiteSummary] {
@@ -113,7 +126,7 @@ enum Snapshot {
     private static func troubled() -> [SiteSummary] {
         var sites = healthy()
         sites[0] = site("acme-rockets.com", score: 77, ms: 240, seed: 3, uptime: 0.9871,
-                        buckets: day(around: 240, seed: 3, spike: 37..<40, down: 46..<48),
+                        buckets: day(around: 240, seed: 3, spike: 37..<40, down: 46..<48), strip: week(down: [15, 27]),
                         events: [
                             (.down, .critical, "Down: the server refused the connection.", 12.0 * 60),
                             (.slow, .warning, "Slow: 1.9 s, usually 240 ms.", 4.6 * 3600),
@@ -132,7 +145,7 @@ enum Snapshot {
     }
 
     private static func model(_ sites: [SiteSummary], _ change: (WatchModel) -> Void = { _ in }) -> WatchModel {
-        let model = WatchModel(watcher: nil)
+        let model = WatchModel(watcher: nil, schemes: Pretend())
         model.sites = sites
         model.now = now
         model.lastChecked = sites.isEmpty ? nil : now.addingTimeInterval(-140)
@@ -140,18 +153,26 @@ enum Snapshot {
         return model
     }
 
+    /// A week in which nothing happened, and one in which a few things did.
+    private static let quietWeek = WeekSummary(date: now.addingTimeInterval(-26.0 * 3600), sites: 6, uptime: 1)
+    private static let busyWeek = WeekSummary(date: now.addingTimeInterval(-26.0 * 3600), sites: 6, uptime: 0.9992, outages: 1,
+                                              longest: WeekSummary.LongestOutage(host: "acme-rockets.com", seconds: 6.0 * 60),
+                                              certificates: [WeekSummary.Certificate(host: "harbour-coffee.co", expiry: now.addingTimeInterval(9.4 * 86_400))],
+                                              scoreDrops: 1)
+
     private static func scenes() -> [(String, WatchModel)] {
         let troubled = troubled()
         let acme = troubled[0].id
         var fresh = healthy()
-        fresh.append(site("paperplane.app", score: nil, ms: 210, seed: 31, buckets: day(around: 210, seed: 31, from: 47)) {
+        fresh.append(site("paperplane.app", score: nil, ms: 210, seed: 31, buckets: day(around: 210, seed: 31, from: 47), strip: week(from: 27)) {
             $0.audited = nil
         })
         return [
-            ("fine", model(healthy())),
-            ("down", model(troubled) { $0.expanded = acme; $0.selected = acme }),
+            ("fine", model(healthy()) { $0.summary = quietWeek }),
+            ("down", model(troubled) { $0.expanded = acme; $0.selected = acme; $0.summary = busyWeek }),
+            ("summary", model(troubled) { $0.summary = busyWeek; $0.summaryOpen = true }),
             ("attention", model(troubled.filter { $0.site.host != "acme-rockets.com" })),
-            ("settings", model(healthy()) { $0.showSettings = true }),
+            ("settings", model(healthy()) { $0.showSettings = true; $0.summary = quietWeek }),
             ("checking", model(fresh) { $0.activity = .auditing("paperplane.app"); $0.expanded = fresh[6].id }),
             ("not-added", model(Array(healthy().prefix(3))) {
                 $0.draft = "acme-rokets.com"
