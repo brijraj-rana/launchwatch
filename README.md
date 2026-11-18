@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/BRIJRAJ-02/launchwatch/actions/workflows/ci.yml"><img src="https://github.com/BRIJRAJ-02/launchwatch/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/brijraj-rana/launchwatch/actions/workflows/ci.yml"><img src="https://github.com/brijraj-rana/launchwatch/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/macOS-14%2B-black" alt="macOS 14+">
   <img src="https://img.shields.io/badge/SwiftUI-native-black" alt="SwiftUI">
   <img src="https://img.shields.io/badge/license-MIT-black" alt="MIT">
@@ -22,7 +22,7 @@
 
 ## What it does
 
-[Launchcheck](https://github.com/BRIJRAJ-02/launchcheck) audits a site once, before it goes live. Launchwatch is what happens after: it keeps checking the sites that are already live, and speaks up when one of them stops being fine.
+[Launchcheck](https://github.com/brijraj-rana/launchcheck) audits a site once, before it goes live. Launchwatch is what happens after: it keeps checking the sites that are already live, and speaks up when one of them stops being fine.
 
 - **Is it up?** One request to the home page every five minutes. Two failures in a row before anything is called down, so a dropped request alarms nobody. A failed check is tried again 30 seconds later.
 - **Is it slow?** Slow means slow for that site: three times its own median over the last day, twice in a row. There is no fixed number.
@@ -38,7 +38,7 @@
 - **The week in one sentence.** On Monday at 9:00, or the first time the Mac is awake after that, one notification sums up the last seven days: "Last week: 6 sites, 99.9% up, 1 outage (acme-rockets.com, 12 minutes), harbour-coffee.co's certificate expires in 9 days, 1 score fell." When nothing happened it says so: "Last week: all 6 sites stayed up." It is sent once a week and never twice, and stays in the panel until the next one.
 - **What the audit found, in the panel.** See issues opens the list in the row itself: most serious first, each with how many pages, and on a click why it matters, when it counts as done and the first few addresses. Copy as Markdown puts the whole list on the clipboard for a ticket or a client.
 
-Launchwatch works on its own. It runs the audit itself and shows what it found; nothing in it needs another app. [Launchcheck](https://github.com/BRIJRAJ-02/launchcheck) adds the full report, page by page: with it installed, an open row gains Open report beside See issues. Without it, the issues view mentions once, quietly, where to get it, and nothing else in the app does.
+Launchwatch works on its own. It runs the audit itself and shows what it found; nothing in it needs another app. [Launchcheck](https://github.com/brijraj-rana/launchcheck) adds the full report, page by page: with it installed, an open row gains Open report beside See issues. Without it, the issues view mentions once, quietly, where to get it, and nothing else in the app does.
 
 <p align="center">
   <img src="docs/fine-dark.png" width="460" alt="The panel in dark mode with the headline All 6 sites are fine">
@@ -48,7 +48,7 @@ Launchwatch works on its own. It runs the audit itself and shows what it found; 
 
 ### Download
 
-Get `Launchwatch-x.y.z.dmg` from the [latest release](https://github.com/BRIJRAJ-02/launchwatch/releases/latest), open it and drag Launchwatch to Applications. It runs on Apple Silicon and Intel, macOS 14 or later.
+Get `Launchwatch-x.y.z.dmg` from the [latest release](https://github.com/brijraj-rana/launchwatch/releases/latest), open it and drag Launchwatch to Applications. It runs on Apple Silicon and Intel, macOS 14 or later.
 
 The app is not notarized, so macOS blocks the first launch. Either allow it under System Settings → Privacy & Security → Open Anyway, or run:
 
@@ -58,10 +58,10 @@ xattr -dr com.apple.quarantine /Applications/Launchwatch.app
 
 ### Build from source
 
-Requires Xcode 16 or later (for the Swift toolchain). The audit engine is fetched from the [Launchcheck](https://github.com/BRIJRAJ-02/launchcheck) repository as a package.
+Requires Xcode 16 or later (for the Swift toolchain). The audit engine is fetched from the [Launchcheck](https://github.com/brijraj-rana/launchcheck) repository as a package.
 
 ```bash
-git clone https://github.com/BRIJRAJ-02/launchwatch.git
+git clone https://github.com/brijraj-rana/launchwatch.git
 cd launchwatch
 ./scripts/build-app.sh --install   # builds, copies Launchwatch.app to /Applications, launches it
 ```

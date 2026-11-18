@@ -145,6 +145,6 @@ public enum ReportOffer: Equatable, Sendable {
     }
 
     /// Where Launchcheck can be had.
-    public static let download = URL(string: "https://github.com/BRIJRAJ-02/launchcheck/releases/latest")!
+    public static let download = URL(string: "https://github.com/brijraj-rana/launchcheck/releases/latest")!
     public static let pitch = "Launchcheck adds the full report, page by page."
 }

@@ -556,7 +556,7 @@ final class ReportOfferTests: XCTestCase {
     }
 
     func testWhereItIsAndWhatItAdds() {
-        XCTAssertEqual(ReportOffer.download.absoluteString, "https://github.com/BRIJRAJ-02/launchcheck/releases/latest")
+        XCTAssertEqual(ReportOffer.download.absoluteString, "https://github.com/brijraj-rana/launchcheck/releases/latest")
         XCTAssertEqual(ReportOffer.pitch, "Launchcheck adds the full report, page by page.")
     }
 

@@ -10,7 +10,7 @@ let package = Package(
     ],
     dependencies: [
         // The audit engine, shared with Launchcheck.
-        .package(url: "https://github.com/BRIJRAJ-02/launchcheck.git", from: "0.2.1"),
+        .package(url: "https://github.com/brijraj-rana/launchcheck.git", from: "0.2.1"),
     ],
     targets: [
         // UI-free watcher: pulses, audits, what counts as an event, what is due when, and the files it keeps.
