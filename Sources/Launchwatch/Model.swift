@@ -29,11 +29,27 @@ final class WatchModel: ObservableObject {
     @Published var summaryOpen = false
     /// True when some app on this Mac opens launchcheck links.
     @Published var canOpenReport = false
+    /// The site whose issues are being read in its open row.
+    @Published var showingIssues: UUID?
+    /// The issue opened within that list.
+    @Published var openIssue: String?
+    /// What the last audit found, for the sites whose list has been asked for. A site with no entry has no report kept yet.
+    @Published var issues: [UUID: IssueList] = [:]
     @Published var now = Date()
 
     @Published var expanded: UUID?
     @Published var selected: UUID?
     @Published var confirmingRemoval: UUID?
+    /// The site whose row is asking how long to pause for.
+    @Published var pausing: UUID?
+    /// True while a field inside the panel, other than the address field, has the keyboard.
+    @Published var fieldFocused = false
+
+    /// The webhook address as it stands in the field, kept or not.
+    @Published var webhookDraft = ""
+    /// What became of the last message sent to the webhook, when that is worth saying.
+    @Published var webhookNote: String?
+    @Published var webhookSending = false
     @Published var showSettings = false
     @Published var launchAtLogin = false
 
@@ -56,6 +72,7 @@ final class WatchModel: ObservableObject {
 
     private let watcher: Watcher?
     private let schemes: SchemeChecking
+    private let poster: WebhookPosting = URLSessionWebhook()
     private var queue: Task<Void, Never>?
     private var waiting = 0
 
@@ -73,6 +90,7 @@ final class WatchModel: ObservableObject {
     var isBusy: Bool { activity != nil || adding != nil }
 
     /// The most serious condition of any site, for the menu bar dot.
+    /// A paused site is neither, so it never lights the dot.
     var attention: Health.Condition? {
         guard !offline else { return nil }
         return sites.map(\.health.condition).filter { $0 == .critical || $0 == .warning }.min()
@@ -111,11 +129,18 @@ final class WatchModel: ObservableObject {
     func refresh() async {
         guard let watcher else { return }
         sites = await watcher.summaries()
+        let kept = settings.webhook ?? ""
         settings = await watcher.settings
+        // The field follows what is kept, unless someone is in the middle of changing it.
+        if webhookDraft == kept { webhookDraft = settings.webhook ?? "" }
         lastChecked = await watcher.lastChecked()
         summary = await watcher.summary
         now = Date()
         if let expanded, !sites.contains(where: { $0.id == expanded }) { self.expanded = nil }
+        // A list that is open follows the audit it was read from.
+        if let showingIssues {
+            if sites.contains(where: { $0.id == showingIssues }) { issues[showingIssues] = await watcher.issues(for: showingIssues) } else { self.showingIssues = nil }
+        }
         if let selected, !sites.contains(where: { $0.id == selected }) { self.selected = nil }
     }
 
@@ -137,13 +162,13 @@ final class WatchModel: ObservableObject {
             return
         }
         let entries = await watcher.entries
-        let due = everything ? entries.map(\.site.id) : await watcher.pulsesDue()
+        let due = everything ? entries.filter { !Pausing.isPaused($0.state, now: Date()) }.map(\.site.id) : await watcher.pulsesDue()
         if !due.isEmpty {
             let host = entries.first { $0.site.id == due[0] }?.site.host ?? ""
             activity = .checking(due.count == 1 ? host : "\(due.count) sites")
             let outcome = await watcher.pulse(due)
             offline = outcome.offline && outcome.pulsed == 0
-            announce(outcome.events)
+            tell(outcome.events)
             await refresh()
         }
         if !offline {
@@ -151,11 +176,16 @@ final class WatchModel: ObservableObject {
             if let summary = await watcher.weeklySummaryIfDue() {
                 self.summary = summary
                 announceSummary(summary)
+                deliver([Webhook.Message(summary)])
             }
+            // The registry, once a day for each site. One short request, so it says nothing about itself in the header.
+            let domains = await watcher.domainsDue()
+            for id in domains { tell(await watcher.checkDomain(id)) }
+            if !domains.isEmpty { await refresh() }
             for id in await watcher.auditsDue() {
                 guard let host = sites.first(where: { $0.id == id })?.site.host else { continue }
                 activity = .auditing(host)
-                announce(await watcher.audit(id))
+                tell(await watcher.audit(id))
                 await refresh()
             }
         }
@@ -165,18 +195,118 @@ final class WatchModel: ObservableObject {
     /// Pulses and audits one site now.
     func check(_ id: UUID) {
         enqueue { [weak self] in
-            guard let self, let watcher = self.watcher, let host = self.sites.first(where: { $0.id == id })?.site.host else { return }
+            guard let self, let watcher = self.watcher, let site = self.sites.first(where: { $0.id == id }), !site.isPaused else { return }
+            let host = site.site.host
             self.activity = .checking(host)
             let outcome = await watcher.pulse([id])
             self.offline = outcome.offline
-            self.announce(outcome.events)
+            self.tell(outcome.events)
             await self.refresh()
             if !outcome.offline, self.sites.first(where: { $0.id == id })?.state.failures == 0 {
                 self.activity = .auditing(host)
-                self.announce(await watcher.audit(id))
+                self.tell(await watcher.audit(id))
                 await self.refresh()
             }
             self.activity = nil
+        }
+    }
+
+    /// One pulse of one site, after something about it changed.
+    private func pulseSoon(_ id: UUID, after change: @escaping (Watcher) async -> Void) {
+        enqueue { [weak self] in
+            guard let self, let watcher = self.watcher else { return }
+            await change(watcher)
+            await self.refresh()
+            guard self.online, let site = self.sites.first(where: { $0.id == id }), !site.isPaused else { return }
+            self.activity = .checking(site.site.host)
+            let outcome = await watcher.pulse([id])
+            self.tell(outcome.events)
+            await self.refresh()
+            self.activity = nil
+        }
+    }
+
+    // MARK: Pausing
+
+    func pause(_ id: UUID, for length: PauseLength) {
+        pausing = nil
+        guard let watcher else { return }
+        Task {
+            await watcher.pause(id, for: length)
+            await refresh()
+        }
+    }
+
+    /// Ends a pause and looks at the site straight away.
+    func resume(_ id: UUID) {
+        pulseSoon(id) { await $0.resume(id) }
+    }
+
+    // MARK: Must contain
+
+    /// Keeps the phrase a site's home page must show, and looks for it at once. An empty phrase asks nothing.
+    func setPhrase(_ id: UUID, _ phrase: String) {
+        guard let site = sites.first(where: { $0.id == id }), Phrase.cleaned(phrase) != site.site.mustContain else { return }
+        pulseSoon(id) { await $0.setPhrase(id, phrase) }
+    }
+
+    // MARK: Webhook
+
+    /// Says the new events here, and to the channel if there is one.
+    private func tell(_ events: [SiteEvent]) {
+        guard !events.isEmpty else { return }
+        announce(events)
+        deliver(events.map { Webhook.Message($0) })
+    }
+
+    /// Posts to the webhook, one message after another, without holding anything else up. A message that does not
+    /// arrive is not tried again; Settings says so, until one arrives.
+    private func deliver(_ messages: [Webhook.Message]) {
+        let address = settings.webhook
+        let requests = messages.compactMap { Webhook.request(to: address, $0) }
+        guard !requests.isEmpty else { return }
+        Task {
+            for request in requests {
+                let problem = await poster.post(request)
+                webhookNote = problem.map { "Last event was not delivered. \($0)" }
+            }
+        }
+    }
+
+    /// Keeps what is in the webhook field. An empty field means no webhook, and nothing is sent anywhere.
+    func commitWebhook() {
+        let text = webhookDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text != (settings.webhook ?? "") else { return }
+        webhookNote = nil
+        change { $0.webhook = text.isEmpty ? nil : text }
+    }
+
+    /// True when what is in the field is an address a message could go to.
+    var webhookUsable: Bool { Webhook.url(from: webhookDraft) != nil }
+
+    func sendTest() {
+        commitWebhook()
+        guard !webhookSending, let request = Webhook.request(to: settings.webhook, .test(now: Date())) else { return }
+        webhookSending = true
+        webhookNote = nil
+        Task {
+            let problem = await poster.post(request)
+            webhookSending = false
+            webhookNote = problem ?? "Test sent."
+        }
+    }
+
+    /// The quiet line under the webhook field.
+    var webhookLine: String? {
+        let text = webhookDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.isEmpty { return nil }
+        guard let url = Webhook.url(from: text) else { return "That does not look like a web address." }
+        if webhookSending { return "Sending a test." }
+        if let webhookNote { return webhookNote }
+        switch Webhook.flavor(of: url) {
+        case .slack: return "Every event is posted as a Slack message."
+        case .discord: return "Every event is posted as a Discord message."
+        case .plain: return "Every event is posted as JSON."
         }
     }
 
@@ -204,6 +334,7 @@ final class WatchModel: ObservableObject {
     func remove(_ id: UUID) {
         guard let watcher else { return }
         confirmingRemoval = nil
+        pausing = nil
         if expanded == id { expanded = nil }
         Task {
             await watcher.remove(id)
@@ -214,6 +345,50 @@ final class WatchModel: ObservableObject {
     func open(_ id: UUID) {
         guard let address = sites.first(where: { $0.id == id })?.site.url, let url = URL(string: address) else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    // MARK: Issues
+
+    /// Opens or closes the list of what the last audit found, read from the report kept on this Mac.
+    func toggleIssues(_ id: UUID) {
+        let opening = showingIssues != id
+        openIssue = nil
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let change = { self.showingIssues = opening ? id : nil }
+        if reduceMotion { change() } else { withAnimation(opening ? Motion.expand : Motion.collapse, change) }
+        if opening { loadIssues(id) }
+    }
+
+    private func loadIssues(_ id: UUID) {
+        guard let watcher else { return }
+        Task { issues[id] = await watcher.issues(for: id) }
+    }
+
+    func toggleIssue(_ id: String) {
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let change = { self.openIssue = self.openIssue == id ? nil : id }
+        if reduceMotion { change() } else { withAnimation(openIssue == id ? Motion.collapse : Motion.expand, change) }
+    }
+
+    func copyIssues(_ id: UUID) {
+        guard let list = issues[id] else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(list.markdown, forType: .string)
+        copied = id
+        Task {
+            try? await Task.sleep(nanoseconds: 1_600_000_000)
+            if copied == id { copied = nil }
+        }
+    }
+
+    /// The site whose issues were just copied, so its button can say so for a moment.
+    @Published var copied: UUID?
+
+    /// What sits beside the issue list: the way into Launchcheck, or a quiet word that it exists.
+    var reportOffer: ReportOffer { canOpenReport ? .openReport : .getLaunchcheck }
+
+    func getLaunchcheck() {
+        NSWorkspace.shared.open(ReportOffer.download)
     }
 
     func openReport(_ id: UUID) {
@@ -240,6 +415,9 @@ final class WatchModel: ObservableObject {
         let change = {
             self.expanded = opening ? id : nil
             self.confirmingRemoval = nil
+            self.pausing = nil
+            if self.showingIssues != id || !opening { self.showingIssues = nil }
+            self.openIssue = nil
         }
         selected = id
         if animated, !reduceMotion {
@@ -270,6 +448,8 @@ final class WatchModel: ObservableObject {
     /// Back to a tidy panel, ready for the next time it opens.
     func settle() {
         confirmingRemoval = nil
+        pausing = nil
+        fieldFocused = false
         addProblem = nil
         summaryOpen = false
         now = Date()

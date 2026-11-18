@@ -89,7 +89,10 @@ private struct Header: View {
             return "\(last)Checks resume once online."
         }
         if let activity = model.activity { return activity.words }
-        return model.lastChecked.map { "Checked \($0.ago(from: model.now))" } ?? "Not checked yet"
+        let paused = model.sites.filter(\.isPaused).count
+        if paused == model.sites.count { return "Nothing is being checked." }
+        let checked = model.lastChecked.map { "Checked \($0.ago(from: model.now))" } ?? "Not checked yet"
+        return paused == 0 ? checked : "\(checked), \(paused) paused"
     }
 }
 
@@ -136,14 +139,30 @@ private struct SiteRow: View {
                 .accessibilityLabel(site.spoken)
                 .accessibilityHint(isExpanded ? "Hides the details" : "Shows recent events and actions")
                 .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
-                .accessibilityAction(named: "Check now") { model.check(site.id) }
                 .accessibilityAction(named: "Open site") { model.open(site.id) }
                 .accessibilityActions {
+                    if site.isPaused {
+                        Button("Resume") { model.resume(site.id) }
+                    } else {
+                        Button("Check now") { model.check(site.id) }
+                        ForEach(PauseLength.allCases, id: \.self) { length in
+                            Button(length.spoken) { model.pause(site.id, for: length) }
+                        }
+                    }
                     if model.canOpenReport { Button("Open report in Launchcheck") { model.openReport(site.id) } }
                 }
                 .accessibilityAction(named: "Remove") { model.remove(site.id) }
                 .contextMenu {
-                    Button("Check Now") { model.check(site.id) }
+                    if site.isPaused {
+                        Button("Resume") { model.resume(site.id) }
+                    } else {
+                        Button("Check Now") { model.check(site.id) }
+                        Menu("Pause") {
+                            Button("For 1 Hour") { model.pause(site.id, for: .hour) }
+                            Button("Until Tomorrow") { model.pause(site.id, for: .tomorrow) }
+                            Button("Until Resumed") { model.pause(site.id, for: .untilResumed) }
+                        }
+                    }
                     Button("Open Site") { model.open(site.id) }
                     if model.canOpenReport { Button("Open Report in Launchcheck") { model.openReport(site.id) } }
                     Button("Copy Address") {
@@ -169,7 +188,7 @@ private struct SiteRow: View {
                     .font(isExpanded ? Face.addressStrong : Face.address)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                if let note = site.health.note, !model.offline {
+                if let note = site.health.note, !model.offline || site.isPaused {
                     Text(note)
                         .font(Face.small)
                         .monospacedDigit()
@@ -178,11 +197,13 @@ private struct SiteRow: View {
                 }
             }
             Spacer(minLength: 12)
-            Sparkline(buckets: site.buckets, muted: model.offline)
+            Sparkline(buckets: site.buckets, muted: model.offline || site.isPaused)
                 .frame(width: 72, height: 18)
             score
                 .frame(width: 36, alignment: .trailing)
         }
+        // A paused site steps back: still there, plainly not being watched.
+        .opacity(site.isPaused ? 0.5 : 1)
         .padding(.horizontal, Metrics.gutter)
         .frame(height: Metrics.row)
         .frame(maxWidth: .infinity)
@@ -193,7 +214,7 @@ private struct SiteRow: View {
             Text("\(score)")
                 .font(Face.body)
                 .monospacedDigit()
-                .foregroundStyle(model.offline ? .secondary : .primary)
+                .foregroundStyle(model.offline || site.isPaused ? .secondary : .primary)
         } else {
             // Not audited yet: an empty place for the score, not a zero.
             Circle()
@@ -210,8 +231,15 @@ private struct SiteDetail: View {
     @ObservedObject var model: WatchModel
     let site: SiteSummary
     @Environment(\.isSnapshot) private var isSnapshot
+    @State private var phraseDraft: String
 
     private static let eventsShown = 4
+
+    init(model: WatchModel, site: SiteSummary) {
+        self.model = model
+        self.site = site
+        _phraseDraft = State(initialValue: site.site.mustContain ?? "")
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -219,37 +247,92 @@ private struct SiteDetail: View {
             VStack(alignment: .leading, spacing: 9) {
                 // The week first, then the figure that sums it up.
                 if !site.strip.isEmpty {
-                    UptimeStrip(cells: site.strip, width: Metrics.width - Metrics.indent - Metrics.gutter, muted: model.offline)
+                    UptimeStrip(cells: site.strip, width: Self.width, muted: model.offline)
                 }
                 HStack(alignment: .top, spacing: 0) {
                     fact(site.uptime.map(Words.percent) ?? "No data", "Uptime, 7 days")
-                    fact(site.median.map(Words.time) ?? "No data", "Usual response")
                     fact(certificate, "Certificate until")
+                    fact(domain, "Domain until")
+                        .help(domainHelp)
                 }
             }
-            Text(auditLine)
-                .font(Face.small)
-                .monospacedDigit()
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            HStack(spacing: 6) {
-                Button("Check now") { model.check(site.id) }
-                    .disabled(model.isBusy)
-                    .help("Check this site now")
-                Button("Open site") { model.open(site.id) }
-                    .help("Open \(site.site.host) in the browser")
-                // Four buttons fill the row, so the report steps aside while "Stop watching" is asking its question.
-                if model.canOpenReport, model.confirmingRemoval != site.id {
-                    Button("Open report") { model.openReport(site.id) }
-                        .help("Open the full report for \(site.site.host) in Launchcheck")
+            // The day: every response time kept, against the usual one.
+            VStack(alignment: .leading, spacing: 5) {
+                if site.chart.hasReadings {
+                    ResponseChartView(chart: site.chart, width: Self.width, muted: model.offline)
                 }
-                Spacer(minLength: 0)
-                if model.confirmingRemoval == site.id {
-                    Button("Stop watching") { model.remove(site.id) }
-                        .accessibilityLabel("Confirm: stop watching \(site.site.host)")
+                HStack(spacing: 0) {
+                    Text(site.chart.hasReadings ? "Response, 24 hours" : "No response times in the last 24 hours")
+                    Spacer(minLength: 0)
+                    if site.chart.median != nil {
+                        Text("usual").frame(width: 44, alignment: .leading)
+                    }
+                }
+                .font(Face.small)
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            }
+            // The audit: what it scored, then a way to read what it found, here or in Launchcheck.
+            VStack(alignment: .leading, spacing: 9) {
+                Text(auditLine)
+                    .font(Face.small)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if site.state.score != nil {
+                    HStack(spacing: 6) {
+                        Button(showingIssues ? "Hide issues" : "See issues") { model.toggleIssues(site.id) }
+                            .help("Read what the last audit found, without leaving the panel")
+                        if model.canOpenReport {
+                            Button("Open report") { model.openReport(site.id) }
+                                .help("Open the full report for \(site.site.host) in Launchcheck")
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .buttonStyle(QuietButton())
+                    if showingIssues {
+                        IssuesView(model: model, site: site, list: model.issues[site.id])
+                            .transition(.soft)
+                    }
+                }
+            }
+            phrase
+            // Checking, pausing and removing. Pausing and removing each ask one question before they act.
+            HStack(spacing: 6) {
+                if model.pausing == site.id {
+                    ForEach(PauseLength.allCases, id: \.self) { length in
+                        Button(length.title) { model.pause(site.id, for: length) }
+                            .accessibilityLabel(length.spoken)
+                            .help(length.hint)
+                    }
+                    Spacer(minLength: 0)
+                    Button { model.pausing = nil } label: { Image(systemName: "xmark") }
+                        .buttonStyle(IconButton())
+                        .help("Do not pause")
+                        .accessibilityLabel("Do not pause")
                 } else {
-                    Button("Remove") { model.confirmingRemoval = site.id }
-                        .accessibilityLabel("Remove \(site.site.host)")
+                    if site.isPaused {
+                        Button("Resume") { model.resume(site.id) }
+                            .help("Start checking \(site.site.host) again")
+                    } else {
+                        Button("Check now") { model.check(site.id) }
+                            .disabled(model.isBusy)
+                            .help("Check this site now")
+                    }
+                    Button("Open site") { model.open(site.id) }
+                        .help("Open \(site.site.host) in the browser")
+                    if !site.isPaused, model.confirmingRemoval != site.id {
+                        Button("Pause") { model.pausing = site.id }
+                            .help("Stop checking \(site.site.host) for a while")
+                    }
+                    Spacer(minLength: 0)
+                    if model.confirmingRemoval == site.id {
+                        Button("Stop watching") { model.remove(site.id) }
+                            .accessibilityLabel("Confirm: stop watching \(site.site.host)")
+                    } else {
+                        Button("Remove") { model.confirmingRemoval = site.id }
+                            .accessibilityLabel("Remove \(site.site.host)")
+                    }
                 }
             }
             .buttonStyle(QuietButton())
@@ -259,6 +342,39 @@ private struct SiteDetail: View {
         .padding(.top, 4)
         .padding(.bottom, 16)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .onAppear { phraseDraft = site.site.mustContain ?? "" }
+        .onChange(of: site.site.mustContain) { _, kept in phraseDraft = kept ?? "" }
+    }
+
+    private static let width = Metrics.width - Metrics.indent - Metrics.gutter
+    private var showingIssues: Bool { model.showingIssues == site.id }
+
+    /// The phrase the home page must show: a label, a field, and how the last look went.
+    private var phrase: some View {
+        HStack(spacing: 8) {
+            Text("Must contain")
+                .font(Face.small)
+                .foregroundStyle(.secondary)
+                .fixedSize()
+            QuietField(label: "Must contain", prompt: "A phrase, like Add to cart", text: $phraseDraft,
+                       commit: { model.setPhrase(site.id, phraseDraft) },
+                       focusChanged: { model.fieldFocused = $0 })
+            if let status = phraseStatus {
+                Text(status)
+                    .font(Face.small)
+                    .foregroundStyle(site.state.missingPhrase == nil ? .secondary : .primary)
+                    .fixedSize()
+            }
+        }
+        .help("Report the site when its home page stops showing this phrase")
+    }
+
+    /// "Found", "Missing", or nothing while there is no phrase or it has not been looked for yet.
+    private var phraseStatus: String? {
+        guard site.site.mustContain != nil, Phrase.cleaned(phraseDraft) == site.site.mustContain else { return nil }
+        if site.state.missingPhrase != nil { return "Missing" }
+        guard let misses = site.state.phraseMisses else { return nil }
+        return misses == 0 ? "Found" : "Not found"
     }
 
     private func fact(_ value: String, _ label: String) -> some View {
@@ -284,6 +400,21 @@ private struct SiteDetail: View {
         return expiry.formatted(.dateTime.day().month(.abbreviated).year())
     }
 
+    /// The day the registration runs out, or why there is no day to show.
+    private var domain: String {
+        if let expiry = site.state.domainExpiry { return expiry.formatted(.dateTime.day().month(.abbreviated).year()) }
+        guard model.settings.domainExpiry, Domain.registrable(site.site.host) != nil else { return "Not checked" }
+        return site.state.domainChecked == nil ? "Not checked yet" : "Not known"
+    }
+
+    private var domainHelp: String {
+        guard let name = Domain.registrable(site.site.host) else { return "This address has no domain of its own to ask about" }
+        guard model.settings.domainExpiry else { return "Domain expiry is switched off in the settings" }
+        guard let checked = site.state.domainChecked else { return "The registry for \(name) has not been asked yet" }
+        return site.state.domainExpiry == nil ? "The registry for \(name) gave no expiry date, asked \(checked.ago(from: model.now))"
+                                              : "\(name), from its registry, asked \(checked.ago(from: model.now))"
+    }
+
     private var auditLine: String {
         if case .auditing(let host) = model.activity, host == site.site.host { return "Running the audit now." }
         guard let audited = site.state.audited, let score = site.state.score else {
@@ -307,12 +438,22 @@ private struct SiteDetail: View {
                         Circle().fill(Tone.of(event.level))
                             .frame(width: 6, height: 6)
                             .alignmentGuide(.firstTextBaseline) { $0[.bottom] + 3 }
-                        Text(event.brief)
-                            .font(Face.body)
-                            .monospacedDigit()
-                            .lineLimit(2)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(event.brief)
+                                .font(Face.body)
+                                .monospacedDigit()
+                                .lineLimit(2)
+                                .fixedSize(horizontal: false, vertical: true)
+                            // The likely cause, when the diagnosis found one: quieter, and under what it explains.
+                            if let cause = event.cause {
+                                Text(cause)
+                                    .font(Face.small)
+                                    .monospacedDigit()
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
                         Text(event.date.ago(from: model.now))
                             .font(Face.small)
                             .monospacedDigit()
@@ -326,10 +467,129 @@ private struct SiteDetail: View {
                         }
                     }
                     .accessibilityElement(children: .ignore)
-                    .accessibilityLabel("\(event.brief) \(event.date.ago(from: model.now))")
+                    .accessibilityLabel("\(event.brief) \(event.cause ?? "") \(event.date.ago(from: model.now))")
                 }
             }
         }
+    }
+}
+
+// MARK: Issues
+
+/// What the last audit found, read in place: most serious first, one line each, and the detail of whichever is opened.
+/// Everything here comes from the report Launchwatch keeps itself, so it reads the same with or without Launchcheck.
+private struct IssuesView: View {
+    @ObservedObject var model: WatchModel
+    let site: SiteSummary
+    let list: IssueList?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let list {
+                if list.issues.isEmpty {
+                    quiet("Nothing to fix. The last audit found no issues.")
+                } else {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(Array(list.issues.enumerated()), id: \.element.id) { index, issue in
+                            if index > 0 { Hairline() }
+                            row(issue)
+                        }
+                    }
+                    .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).strokeBorder(Tone.hairline))
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                }
+                HStack(spacing: 6) {
+                    Button(model.copied == site.id ? "Copied" : "Copy as Markdown") { model.copyIssues(site.id) }
+                        .help("Copy the whole list, to paste into a ticket or send to a client")
+                    Spacer(minLength: 0)
+                    if model.reportOffer == .getLaunchcheck {
+                        Button("Get Launchcheck") { model.getLaunchcheck() }
+                            .buttonStyle(QuietLink())
+                            .help("Open the Launchcheck download page")
+                    }
+                }
+                .buttonStyle(QuietButton())
+                if model.reportOffer == .getLaunchcheck {
+                    quiet(ReportOffer.pitch)
+                }
+            } else {
+                quiet("Details appear after the next check.")
+            }
+        }
+    }
+
+    private func quiet(_ text: String) -> some View {
+        Text(text)
+            .font(Face.small)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func row(_ issue: Issue) -> some View {
+        let open = model.openIssue == issue.id
+        return VStack(alignment: .leading, spacing: 0) {
+            Button { model.toggleIssue(issue.id) } label: {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Circle().fill(issue.level.map(Tone.of) ?? Color.secondary.opacity(0.6))
+                        .frame(width: 6, height: 6)
+                        .alignmentGuide(.firstTextBaseline) { $0[.bottom] + 3 }
+                    Text(issue.title)
+                        .font(open ? Face.bodyStrong : Face.body)
+                        .lineLimit(open ? 3 : 1)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Text(issue.extent)
+                        .font(Face.small)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .fixedSize()
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+            }
+            .buttonStyle(RowButton())
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(issue.severityLabel): \(issue.title), \(issue.extent)")
+            .accessibilityHint(open ? "Hides the detail" : "Shows why it matters and where it was found")
+            .accessibilityAddTraits(.isButton)
+            if open {
+                detail(issue)
+                    .transition(.soft)
+            }
+        }
+    }
+
+    private func detail(_ issue: Issue) -> some View {
+        let places = issue.firstPlaces
+        return VStack(alignment: .leading, spacing: 7) {
+            Text(issue.why)
+                .font(Face.small)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            (Text("Done when: ").font(Face.smallStrong) + Text(IssueList.sentence(issue.doneWhen)).font(Face.small))
+                .fixedSize(horizontal: false, vertical: true)
+            if !places.shown.isEmpty {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(Array(places.shown.enumerated()), id: \.offset) { _, place in
+                        Text(place)
+                            .font(Face.address)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    if places.more > 0 {
+                        Text("and \(places.more) more")
+                            .font(Face.small)
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .padding(.leading, 24)
+        .padding(.trailing, 10)
+        .padding(.bottom, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -486,9 +746,31 @@ private struct SettingsRows: View {
             line("Weekly summary on Mondays") {
                 Switch(label: "Weekly summary on Mondays", isOn: model.settings.weeklySummary) { model.change { $0.weeklySummary.toggle() } }
             }
+            line("Watch domain expiry") {
+                Switch(label: "Watch domain expiry", isOn: model.settings.domainExpiry) { model.change { $0.domainExpiry.toggle() } }
+            }
+            .help("Once a day, asks rdap.org when each site's domain runs out")
             line("Open at login") {
                 Switch(label: "Open at login", isOn: model.launchAtLogin) { model.setLaunchAtLogin(!model.launchAtLogin) }
             }
+            line("Post events to a webhook") {
+                Button("Send test") { model.sendTest() }
+                    .buttonStyle(QuietButton())
+                    .disabled(!model.webhookUsable || model.webhookSending)
+                    .help("Post one test message to this address")
+            }
+            VStack(alignment: .leading, spacing: 7) {
+                QuietField(label: "Webhook address", prompt: "Slack, Discord or any webhook address", text: $model.webhookDraft, font: Face.address,
+                           commit: { model.commitWebhook() }, focusChanged: { model.fieldFocused = $0 })
+                if let note = model.webhookLine {
+                    Text(note)
+                        .font(Face.small)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(.horizontal, Metrics.gutter)
+            .padding(.bottom, 8)
         }
         .padding(.vertical, 6)
     }
@@ -559,6 +841,25 @@ private struct Footer: View {
                     .animation(Motion.press, value: configuration.isPressed)
                     .onHover { hovering = $0 }
             }
+        }
+    }
+}
+
+extension PauseLength {
+    /// The whole instruction, for VoiceOver and menus where the button's own word is not enough.
+    var spoken: String {
+        switch self {
+        case .hour: return "Pause for 1 hour"
+        case .tomorrow: return "Pause until tomorrow"
+        case .untilResumed: return "Pause until resumed"
+        }
+    }
+
+    var hint: String {
+        switch self {
+        case .hour: return "Checks start again in an hour"
+        case .tomorrow: return "Checks start again at \(PauseLength.morning):00 tomorrow"
+        case .untilResumed: return "Checks stay off until you resume them"
         }
     }
 }

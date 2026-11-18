@@ -9,6 +9,8 @@ final class StubPulser: Pulser, @unchecked Sendable {
     private let lock = NSLock()
     private var answers: [String: [PulseResult]] = [:]
     private(set) var asked: [String] = []
+    /// The hosts whose page was asked for as well as its answer.
+    private(set) var read: [String] = []
 
     /// Queues answers for a host. The last one repeats once the queue runs out.
     func queue(_ host: String, _ results: PulseResult...) {
@@ -17,10 +19,11 @@ final class StubPulser: Pulser, @unchecked Sendable {
         lock.unlock()
     }
 
-    func pulse(_ url: URL) async -> PulseResult {
+    func pulse(_ url: URL, readingBody: Bool) async -> PulseResult {
         lock.withLock {
             let host = url.host ?? ""
             asked.append(host)
+            if readingBody { read.append(host) }
             guard var list = answers[host], !list.isEmpty else { return PulseResult(status: 0, error: "the address does not exist") }
             let next = list.count > 1 ? list.removeFirst() : list[0]
             answers[host] = list
@@ -627,7 +630,7 @@ final class WatcherTests: XCTestCase {
 
     private func watcher() -> Watcher {
         let clock = self.clock!
-        return Watcher(store: Store(directory: directory), pulser: pulser, auditor: auditor, clock: { clock.now })
+        return Watcher(store: Store(directory: directory), pulser: pulser, auditor: auditor, domains: StubDomains(), sideDoor: StubSideDoor(), clock: { clock.now })
     }
 
     func testAddingValidatesWithOnePulse() async {
@@ -1109,7 +1112,7 @@ final class WeeklyWatcherTests: XCTestCase {
 
     private func watcher() -> Watcher {
         let clock = self.clock!
-        return Watcher(store: Store(directory: directory), pulser: pulser, auditor: StubAuditor(), clock: { clock.now }, calendar: calendar())
+        return Watcher(store: Store(directory: directory), pulser: pulser, auditor: StubAuditor(), domains: StubDomains(), sideDoor: StubSideDoor(), clock: { clock.now }, calendar: calendar())
     }
 
     /// Lets time pass to `end`, pulsing once an hour on the way and once on arriving.

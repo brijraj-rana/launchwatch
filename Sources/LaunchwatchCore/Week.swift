@@ -18,6 +18,7 @@ public struct StripCell: Equatable, Sendable {
         case up         // checked, and never down
         case down       // down for at least some of it
         case empty      // not checked: the Mac was asleep, or the site was not being watched yet
+        case paused     // not checked, because the site was paused
     }
 
     public var state: State
@@ -36,13 +37,15 @@ public struct StripCell: Equatable, Sendable {
         case .up: return "up"
         case .down: return "down for some of it"
         case .empty: return "not checked"
+        case .paused: return "paused"
         }
     }
 }
 
 extension Stats {
     /// True for each failed pulse that belongs to a run long enough to be called down. One dropped request is not an outage.
-    static func downFlags(_ samples: [Sample]) -> [Bool] {
+    /// A pause ends a run: failures either side of one are not the same outage.
+    static func downFlags(_ samples: [Sample], pauses: [Pause] = []) -> [Bool] {
         var flags = [Bool](repeating: false, count: samples.count)
         var index = 0
         while index < samples.count {
@@ -51,7 +54,8 @@ extension Stats {
                 continue
             }
             var end = index
-            while end + 1 < samples.count, !samples[end + 1].ok { end += 1 }
+            while end + 1 < samples.count, !samples[end + 1].ok,
+                  pauseBegan(after: samples[end].date, upTo: samples[end + 1].date, pauses: pauses) == nil { end += 1 }
             if end - index + 1 >= Detector.failuresBeforeDown {
                 for marked in index...end { flags[marked] = true }
             }
@@ -61,12 +65,25 @@ extension Stats {
     }
 
     /// The outages that touch the window, oldest first, measured the way the "back after" message measures them.
-    public static func outages(_ samples: [Sample], now: Date, window: TimeInterval = keep) -> [Outage] {
+    /// An outage that a pause interrupts ends where the pause begins, so paused time is never counted as downtime.
+    public static func outages(_ samples: [Sample], now: Date, window: TimeInterval = keep, pauses: [Pause] = []) -> [Outage] {
         let opening = now.addingTimeInterval(-window)
         var found: [Outage] = []
         var first: Date?
         var run = 0
+        var previous: Date?
+        /// Closes the run under way if a pause began between the last reading and `moment`.
+        func breakAtPause(before moment: Date) {
+            guard let last = previous, let began = pauseBegan(after: last, upTo: moment, pauses: pauses) else { return }
+            if run >= Detector.failuresBeforeDown, let first, began > opening {
+                found.append(Outage(start: max(first, opening), end: began, ongoing: false))
+            }
+            first = nil
+            run = 0
+        }
         for sample in samples where sample.date <= now {
+            breakAtPause(before: sample.date)
+            previous = sample.date
             if sample.ok {
                 if run >= Detector.failuresBeforeDown, let first, sample.date > opening {
                     found.append(Outage(start: max(first, opening), end: sample.date, ongoing: false))
@@ -78,6 +95,7 @@ extension Stats {
                 run += 1
             }
         }
+        breakAtPause(before: now)
         if run >= Detector.failuresBeforeDown, let first {
             found.append(Outage(start: max(first, opening), end: now, ongoing: true))
         }
@@ -93,13 +111,14 @@ extension Stats {
 
     /// The last week as 28 cells, four a day, oldest first. The last cell is the stretch still under way.
     /// A cell is down when the site was down for any of it, up when it was checked and never down, and empty when it was not checked.
-    public static func strip(_ samples: [Sample], now: Date, calendar: Calendar = .current, days: Int = 7, perDay: Int = 4) -> [StripCell] {
+    /// A cell with no checks in it that a pause reaches into is paused.
+    public static func strip(_ samples: [Sample], now: Date, calendar: Calendar = .current, days: Int = 7, perDay: Int = 4, pauses: [Pause] = []) -> [StripCell] {
         let count = days * perDay
         guard count > 0 else { return [] }
         let length = 86_400.0 / Double(perDay)
         let first = stretchStart(now, calendar: calendar, length: length).addingTimeInterval(-Double(count - 1) * length)
         var states = [StripCell.State](repeating: .empty, count: count)
-        let down = downFlags(samples)
+        let down = downFlags(samples, pauses: pauses)
         for (position, sample) in samples.enumerated() {
             let offset = sample.date.timeIntervalSince(first)
             guard offset >= 0, sample.date <= now else { continue }
@@ -112,16 +131,20 @@ extension Stats {
         }
         return (0..<count).map { index in
             let start = first.addingTimeInterval(Double(index) * length)
-            return StripCell(state: states[index], start: start, end: start.addingTimeInterval(length))
+            let end = start.addingTimeInterval(length)
+            var state = states[index]
+            if state == .empty, pauses.contains(where: { $0.since < min(end, now) && ($0.until ?? now) > start }) { state = .paused }
+            return StripCell(state: state, start: start, end: end)
         }
     }
 
     /// The strip in one sentence, for VoiceOver.
     public static func stripSummary(_ cells: [StripCell]) -> String {
         let down = cells.filter { $0.state == .down }.count
-        let empty = cells.filter { $0.state == .empty }.count
-        guard empty < cells.count else { return "No checks in the last 7 days." }
-        let unchecked = empty == 0 ? "" : " Not checked during \(empty)."
+        let paused = cells.filter { $0.state == .paused }.count
+        let empty = cells.filter { $0.state == .empty }.count + paused
+        guard empty < cells.count else { return paused == cells.count ? "Paused through the last 7 days." : "No checks in the last 7 days." }
+        let unchecked = empty == 0 ? "" : " Not checked during \(empty)\(paused == 0 ? "" : ", paused for \(paused) of them")."
         if down == 0 {
             return empty == 0 ? "Up through all of the last 7 days." : "Up whenever it was checked in the last 7 days.\(unchecked)"
         }
@@ -190,7 +213,7 @@ public struct WeekSummary: Codable, Equatable, Sendable {
     public static func make(entries: [Entry], samples: [UUID: [Sample]], events: [SiteEvent], now: Date, window: TimeInterval = Stats.keep) -> WeekSummary? {
         guard !entries.isEmpty else { return nil }
         let ids = Set(entries.map(\.site.id))
-        let pulses = entries.map { Stats.recent(samples[$0.site.id] ?? [], now: now, window: window) }
+        let pulses = entries.map { Stats.unpaused(Stats.recent(samples[$0.site.id] ?? [], now: now, window: window), pauses: Pausing.spans($0.state, now: now)) }
         let all = pulses.flatMap { $0 }
         let covered = Stats.buckets(all, now: now, window: window, count: 28).filter { $0 != .empty }.count
         guard covered >= stretchesNeeded else { return nil }
@@ -198,13 +221,14 @@ public struct WeekSummary: Codable, Equatable, Sendable {
         var outages = 0
         var longest: LongestOutage?
         for entry in entries {
-            for outage in Stats.outages(samples[entry.site.id] ?? [], now: now, window: window) {
+            for outage in Stats.outages(samples[entry.site.id] ?? [], now: now, window: window, pauses: Pausing.spans(entry.state, now: now)) {
                 outages += 1
                 if outage.length > (longest?.seconds ?? -1) { longest = LongestOutage(host: entry.site.host, seconds: outage.length) }
             }
         }
 
-        let certificates = entries.compactMap { entry -> Certificate? in
+        // A paused site raises nothing, here as everywhere else.
+        let certificates = entries.filter { !Pausing.isPaused($0.state, now: now) }.compactMap { entry -> Certificate? in
             guard let expiry = entry.state.certificateExpiry, CertificateStage.of(expiry: expiry, now: now) >= .soon else { return nil }
             return Certificate(host: entry.site.host, expiry: expiry)
         }.sorted { $0.expiry < $1.expiry }

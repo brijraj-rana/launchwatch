@@ -32,7 +32,7 @@ enum Tone {
         case .critical: return critical
         case .warning: return warning
         case .fine: return good
-        case .unknown: return .secondary
+        case .unknown, .paused: return .secondary
         }
     }
 }
@@ -140,6 +140,7 @@ struct Eyebrow: View {
 }
 
 /// The status dot. A ring when nothing is known yet, so "no news" never reads as "good news".
+/// Two bars when the site is paused: not a color, because a pause is not a verdict.
 struct StatusDot: View {
     let condition: Health.Condition
     var muted = false
@@ -149,6 +150,11 @@ struct StatusDot: View {
         Group {
             if condition == .unknown {
                 Circle().strokeBorder(Color.secondary, lineWidth: 1.5)
+            } else if condition == .paused {
+                HStack(spacing: 2) {
+                    Capsule().fill(Color.secondary).frame(width: 2.5)
+                    Capsule().fill(Color.secondary).frame(width: 2.5)
+                }
             } else {
                 Circle().fill(muted ? Color.secondary.opacity(0.6) : Tone.of(condition))
             }
@@ -197,10 +203,16 @@ struct Sparkline: View {
 }
 
 struct SparkShape: Shape {
-    enum Part { case line, outages }
+    enum Part: Equatable {
+        case line, outages
+        /// A level line across the chart at this many milliseconds.
+        case level(Int)
+    }
 
     let buckets: [Bucket]
     let part: Part
+    /// The time at the top edge, when the caller has worked it out. Otherwise it is read off the buckets.
+    var scale: Int?
 
     func path(in rect: CGRect) -> Path {
         var path = Path()
@@ -212,13 +224,18 @@ struct SparkShape: Shape {
         // The top of the chart is twice the usual time, so a steady site draws a calm line through the middle
         // and only a real spike reaches the top.
         let median = Stats.median(values) ?? 1
-        let top = CGFloat(max(values.max() ?? 1, median * 2, 1))
+        let top = CGFloat(scale ?? max(values.max() ?? 1, median * 2, 1))
         let step = rect.width / CGFloat(buckets.count - 1)
         let floor = rect.maxY - 1
         func x(_ index: Int) -> CGFloat { rect.minX + CGFloat(index) * step }
         func y(_ ms: Int) -> CGFloat { floor - (rect.height - 3) * min(1, CGFloat(ms) / top) }
 
         switch part {
+        case .level(let ms):
+            // On a whole pixel, so a one point line stays one point.
+            let level = (y(ms) * 2).rounded() / 2
+            path.move(to: CGPoint(x: rect.minX, y: level))
+            path.addLine(to: CGPoint(x: rect.maxX, y: level))
         case .line:
             var drawing = false
             var runLength = 0
@@ -261,6 +278,55 @@ extension Bucket {
     var isUp: Bool {
         if case .up = self { return true }
         return false
+    }
+}
+
+// MARK: Response chart
+
+/// The last day of response times in the open row: the row's sparkline with room to breathe.
+/// A dashed line marks the usual time and carries its figure, so the line can be read against it.
+struct ResponseChartView: View {
+    let chart: ResponseChart
+    let width: CGFloat
+    var muted = false
+
+    static let height: CGFloat = 38
+    /// Room at the right for the figure on the dashed line.
+    private static let gutter: CGFloat = 52
+
+    var body: some View {
+        let plot = width - Self.gutter
+        HStack(alignment: .top, spacing: 0) {
+            ZStack {
+                if let median = chart.median {
+                    SparkShape(buckets: chart.buckets, part: .level(median), scale: chart.top)
+                        .stroke(Color.primary.opacity(0.3), style: StrokeStyle(lineWidth: 1, dash: [2, 3]))
+                }
+                SparkShape(buckets: chart.buckets, part: .line, scale: chart.top)
+                    .stroke(Color.primary.opacity(muted ? 0.25 : 0.55), style: StrokeStyle(lineWidth: 1.25, lineCap: .round, lineJoin: .round))
+                SparkShape(buckets: chart.buckets, part: .outages, scale: chart.top)
+                    .stroke(muted ? Color.secondary : Tone.critical, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+            }
+            .frame(width: plot, height: Self.height)
+            if let median = chart.median {
+                // The figure sits level with its line.
+                Text(Words.time(median))
+                    .font(Face.smallStrong)
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .frame(width: Self.gutter - 8, alignment: .leading)
+                    .padding(.leading, 8)
+                    .offset(y: Self.level(of: median, in: chart) - 7)
+            }
+        }
+        .frame(width: width, height: Self.height, alignment: .leading)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(chart.spoken)
+    }
+
+    /// Where a time sits from the top of the chart, by the same sums the line is drawn with.
+    private static func level(of milliseconds: Int, in chart: ResponseChart) -> CGFloat {
+        (height - 1) - (height - 3) * CGFloat(chart.height(of: milliseconds))
     }
 }
 
@@ -316,7 +382,7 @@ struct UptimeStrip: View {
             switch cell.state {
             case .up: return Color.primary.opacity(0.3)
             case .down: return muted ? Color.secondary : Tone.critical
-            case .empty: return Color.primary.opacity(0.11)
+            case .empty, .paused: return Color.primary.opacity(0.11)
             }
         }
 
@@ -355,6 +421,80 @@ struct QuietButton: ButtonStyle {
                 .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).strokeBorder(Tone.hairline))
                 .contentShape(Rectangle())
                 .opacity(isEnabled ? 1 : 0.4)
+                .scaleEffect(configuration.isPressed ? Metrics.press : 1)
+                .animation(Motion.press, value: configuration.isPressed)
+                .onHover { hovering = $0 }
+        }
+    }
+}
+
+/// A one-line field in the shape of the quiet button: a hairline box that darkens a little while it is being typed in.
+/// What is typed is kept when Return is pressed or the field is left.
+struct QuietField: View {
+    let label: String
+    let prompt: String
+    @Binding var text: String
+    var font = Face.body
+    var commit: () -> Void = {}
+    /// Told when the field takes or gives up the keyboard, so the panel's own keys can stand aside.
+    var focusChanged: (Bool) -> Void = { _ in }
+    @FocusState private var focused: Bool
+    @Environment(\.isSnapshot) private var isSnapshot
+
+    var body: some View {
+        Group {
+            if isSnapshot {
+                Text(text.isEmpty ? prompt : text)
+                    .font(text.isEmpty ? Face.body : font)
+                    .foregroundStyle(text.isEmpty ? .tertiary : .primary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                TextField(prompt, text: $text)
+                    .textFieldStyle(.plain)
+                    .font(text.isEmpty ? Face.body : font)
+                    .autocorrectionDisabled()
+                    .focused($focused)
+                    .onSubmit(commit)
+                    .accessibilityLabel(label)
+            }
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 26)
+        .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(focused ? Tone.wash : .clear))
+        .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).strokeBorder(Tone.hairline))
+        .contentShape(Rectangle())
+        .onTapGesture { focused = true }
+        .onChange(of: focused) { _, now in
+            focusChanged(now)
+            if !now { commit() }
+        }
+        .onDisappear {
+            if focused { focusChanged(false) }
+            commit()
+        }
+    }
+}
+
+/// A secondary action in words alone: no outline, grey until the pointer is on it. For things offered, never pressed on anyone.
+struct QuietLink: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        Look(configuration: configuration)
+    }
+
+    private struct Look: View {
+        let configuration: Configuration
+        @State private var hovering = false
+
+        var body: some View {
+            configuration.label
+                .font(Face.small)
+                .foregroundStyle(hovering ? .primary : .secondary)
+                .padding(.horizontal, 7)
+                .frame(height: 24)
+                .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(configuration.isPressed ? Tone.lift : (hovering ? Tone.wash : .clear)))
+                .contentShape(Rectangle())
                 .scaleEffect(configuration.isPressed ? Metrics.press : 1)
                 .animation(Motion.press, value: configuration.isPressed)
                 .onHover { hovering = $0 }

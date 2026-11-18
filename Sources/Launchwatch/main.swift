@@ -22,7 +22,7 @@ enum Notifier {
         guard inBundle else { return }
         let content = UNMutableNotificationContent()
         content.title = event.host
-        content.body = event.message
+        content.body = event.full
         content.userInfo = ["site": event.site.uuidString]
         if event.level == .critical { content.sound = .default }
         UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: event.id.uuidString, content: content, trigger: nil))
@@ -313,11 +313,14 @@ final class StatusController: NSObject, NSWindowDelegate, UNUserNotificationCent
         case 53 where plain:                                   // Esc
             closePanel()
         case 125 where plain:                                  // down
+            if typing, model.fieldFocused { return false }
             model.moveSelection(1)
         case 126 where plain:                                  // up
+            if typing, model.fieldFocused { return false }
             model.moveSelection(-1)
         case 36 where plain, 76 where plain:                   // Return
-            if typing, !model.draft.isEmpty { return false }
+            // In a field, Return belongs to the field: it keeps the phrase or the webhook, and does not fold the row.
+            if typing, !model.draft.isEmpty || model.fieldFocused { return false }
             guard let selected = model.selected else { return false }
             model.toggle(selected, animated: false)
         case 15 where command:                                 // R
@@ -437,6 +440,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let certificate = result.certificateExpiry.map { "certificate \(Words.expiry($0, now: Date()))" } ?? "no certificate seen"
             print(result.ok ? "\(url.host ?? address) answered \(result.status) in \(Words.time(result.milliseconds)), \(certificate)"
                             : "\(url.host ?? address) is down: \(result.reason), \(certificate)")
+            if let phases = result.phases {
+                let parts = PhaseTimings.Phase.allCases.compactMap { phase in phases[phase].map { "\(phase.words) \(Words.time($0))" } }
+                print(parts.joined(separator: ", "))
+            }
+            if !result.ok, let cause = Diagnosis.down(DownEvidence(site: Site(url: url.absoluteString, host: url.host ?? address, added: Date()),
+                                                                   state: SiteState(), result: result, now: Date())) {
+                print(cause.sentence)
+            }
             exit(result.ok ? 0 : 1)
         }
     }
