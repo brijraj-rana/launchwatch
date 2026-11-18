@@ -62,10 +62,48 @@ enum Metrics {
     static let press: CGFloat = 0.97
 }
 
+/// The same motion scale as Launchcheck, after the tokens at transitions.dev: a few durations, one decisive curve,
+/// small distances and a light blur.
 enum Motion {
-    static let press = Animation.easeOut(duration: 0.12)
-    static let expand = Animation.easeOut(duration: 0.2)
-    static let collapse = Animation.easeOut(duration: 0.14)
+    static let quick = 0.15
+    static let fast = 0.25
+
+    /// Starts fast and settles gently.
+    static func smoothOut(_ duration: Double) -> Animation {
+        .timingCurve(0.22, 1, 0.36, 1, duration: duration)
+    }
+
+    static let press = smoothOut(quick)
+    /// A row or the settings opening; closing is quicker than opening.
+    static let expand = smoothOut(fast)
+    static let collapse = smoothOut(quick)
+    /// A pill or a switch thumb travelling.
+    static let move = smoothOut(fast)
+    /// Words changing in place.
+    static let swap = Animation.easeInOut(duration: quick)
+}
+
+private struct Veil: ViewModifier {
+    let blur: CGFloat
+    let y: CGFloat
+    let opacity: Double
+
+    func body(content: Content) -> some View {
+        content.blur(radius: blur).offset(y: y).opacity(opacity)
+    }
+}
+
+extension AnyTransition {
+    /// Content that opens in place: it sharpens as it fades in, with no movement of its own.
+    static var soft: AnyTransition {
+        .modifier(active: Veil(blur: 2, y: 0, opacity: 0), identity: Veil(blur: 0, y: 0, opacity: 1))
+    }
+
+    /// Text swap: the old words leave upward and the new arrive from below, through a light blur.
+    static var swap: AnyTransition {
+        .asymmetric(insertion: .modifier(active: Veil(blur: 2, y: 4, opacity: 0), identity: Veil(blur: 0, y: 0, opacity: 1)),
+                    removal: .modifier(active: Veil(blur: 2, y: -4, opacity: 0), identity: Veil(blur: 0, y: 0, opacity: 1)))
+    }
 }
 
 private struct SnapshotKey: EnvironmentKey {
@@ -310,6 +348,7 @@ struct Segments<Value: Hashable>: View {
     let choices: [(value: Value, title: String)]
     let selection: Value
     let choose: (Value) -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         HStack(spacing: 2) {
@@ -318,6 +357,16 @@ struct Segments<Value: Hashable>: View {
                     .buttonStyle(Segment(selected: choice.value == selection))
                     .accessibilityLabel("\(label), \(choice.title)")
                     .accessibilityAddTraits(choice.value == selection ? .isSelected : [])
+            }
+        }
+        .background(alignment: .leading) {
+            // One pill that slides between the choices.
+            if let index = choices.firstIndex(where: { $0.value == selection }) {
+                RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Tone.surface)
+                    .overlay(RoundedRectangle(cornerRadius: 5, style: .continuous).strokeBorder(Tone.hairline))
+                    .frame(width: 50, height: 20)
+                    .offset(x: CGFloat(index) * 52)
+                    .animation(reduceMotion ? nil : Motion.move, value: index)
             }
         }
         .padding(2)
@@ -343,10 +392,7 @@ struct Segments<Value: Hashable>: View {
                     .foregroundStyle(selected || hovering ? .primary : .secondary)
                     .frame(width: 50, height: 20)
                     .background {
-                        if selected {
-                            RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Tone.surface)
-                                .overlay(RoundedRectangle(cornerRadius: 5, style: .continuous).strokeBorder(Tone.hairline))
-                        } else if configuration.isPressed {
+                        if !selected, configuration.isPressed {
                             RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Tone.lift)
                         }
                     }
@@ -378,7 +424,7 @@ struct Switch: View {
                         .frame(width: 14, height: 14)
                         .padding(2)
                 }
-                .animation(reduceMotion ? nil : Motion.press, value: isOn)
+                .animation(reduceMotion ? nil : Motion.move, value: isOn)
         }
         .buttonStyle(Dip())
         .accessibilityLabel(label)

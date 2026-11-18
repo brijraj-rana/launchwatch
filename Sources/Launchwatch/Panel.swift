@@ -19,7 +19,7 @@ struct PanelView: View {
             Hairline()
             if model.showSettings {
                 SettingsRows(model: model)
-                    .transition(.opacity)
+                    .transition(.soft)
                 Hairline()
             }
             Footer(model: model)
@@ -47,11 +47,18 @@ private struct Header: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(model.verdict)
-                .font(Face.verdict)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .accessibilityAddTraits(.isHeader)
+            // The verdict changing is the one thing worth noticing, so the words swap rather than snap.
+            ZStack(alignment: .leading) {
+                Text(model.verdict)
+                    .font(Face.verdict)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .id(model.verdict)
+                    .transition(.swap)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .animation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : Motion.swap, value: model.verdict)
+            .accessibilityAddTraits(.isHeader)
             HStack(spacing: 6) {
                 if model.activity != nil, !model.sites.isEmpty { Spinner() }
                 Text(subline)
@@ -140,7 +147,7 @@ private struct SiteRow: View {
                 }
             if isExpanded {
                 SiteDetail(model: model, site: site)
-                    .transition(.opacity)
+                    .transition(.soft)
             }
         }
     }
