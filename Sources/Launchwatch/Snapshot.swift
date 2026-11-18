@@ -115,10 +115,10 @@ enum Snapshot {
         sites[0] = site("acme-rockets.com", score: 77, ms: 240, seed: 3, uptime: 0.9871,
                         buckets: day(around: 240, seed: 3, spike: 37..<40, down: 46..<48),
                         events: [
-                            (.down, .critical, "Down: the server refused the connection.", 12 * 60),
+                            (.down, .critical, "Down: the server refused the connection.", 12.0 * 60),
                             (.slow, .warning, "Slow: 1.9 s, usually 240 ms.", 4.6 * 3600),
-                            (.scoreDropped, .warning, "Score fell from 85 to 77, new since last time: pages are set to noindex.", 27 * 3600),
-                            (.recovered, .good, "Back after 6 minutes.", 3 * 86_400),
+                            (.scoreDropped, .warning, "Score fell from 85 to 77, new since last time: pages are set to noindex.", 27.0 * 3600),
+                            (.recovered, .good, "Back after 6 minutes.", 3.0 * 86_400),
                         ]) {
             $0.isDown = true
             $0.failures = 3
