@@ -1,0 +1,15 @@
+{
+  "originHash" : "a7b0780dfc84874b0fd5b70a0d5422f95803a21cb44c0cfda8756ecc2a554b1c",
+  "pins" : [
+    {
+      "identity" : "launchcheck",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/BRIJRAJ-02/launchcheck.git",
+      "state" : {
+        "revision" : "ed08915fc4376e1593c9eba832e540ccda8d938d",
+        "version" : "0.2.1"
+      }
+    }
+  ],
+  "version" : 3
+}
